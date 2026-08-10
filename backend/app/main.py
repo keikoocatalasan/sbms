@@ -12,8 +12,7 @@ from sqlalchemy import func, select
 from . import models, schemas, services
 from .config import get_settings
 from .db import Base, engine
-from .security import DEMO_USERS, DBSession, Principal, current_principal, issue_token, request_id, require_scope
-from .seed import seed_demo
+from .security import ADMIN_SCOPES, DBSession, MEMBER_SCOPES, Principal, current_principal, hash_password, issue_token, request_id, require_scope, verify_password
 
 
 settings = get_settings()
@@ -22,14 +21,10 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
-    if settings.demo_mode:
-        from .db import SessionLocal
-        with SessionLocal() as session:
-            seed_demo(session)
     yield
 
 
-app = FastAPI(title="Argo Subscription Management API", version="1.0.0", lifespan=lifespan, openapi_tags=[{"name": name} for name in ["Infrastructure", "Demo Authentication", "Dashboard", "Customers", "Plans", "Subscriptions", "Invoices", "Payment Attempts", "Payments", "Notifications", "Reports", "Settings", "Activity", "Maintenance"]])
+app = FastAPI(title="Argo Subscription Management API", version="1.0.0", lifespan=lifespan, openapi_tags=[{"name": name} for name in ["Infrastructure", "Authentication", "Dashboard", "Customers", "Plans", "Subscriptions", "Invoices", "Payment Attempts", "Payments", "Notifications", "Reports", "Settings", "Activity", "Maintenance"]])
 app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=False, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"], expose_headers=["X-Request-ID"])
 
 
@@ -77,12 +72,37 @@ def ready(request: Request, db: DBSession) -> dict[str, Any]:
     return ok({"status": "ready", "database": "available"}, request)
 
 
-@app.post("/api/v1/subscription/auth/login", tags=["Demo Authentication"])
-def login(payload: schemas.LoginRequest, request: Request) -> dict[str, Any]:
-    user = DEMO_USERS.get(str(payload.email).lower())
-    if not user or user["password"] != payload.password:
+def auth_payload(user: models.User) -> dict[str, Any]:
+    return {"access_token": issue_token(user), "token_type": "bearer", "user": {"id": user.id, "name": user.name, "email": user.email, "scopes": user.scopes}}
+
+
+@app.post("/api/v1/subscription/auth/signup", status_code=201, tags=["Authentication"])
+def signup(payload: schemas.SignupRequest, request: Request, db: DBSession) -> dict[str, Any]:
+    email = str(payload.email).lower()
+    if db.scalar(select(models.User).where(func.lower(models.User.email) == email)):
+        raise HTTPException(status.HTTP_409_CONFLICT, "An account with that email already exists")
+    organization = db.get(models.Organization, settings.organization_id)
+    if not organization:
+        organization = models.Organization(id=settings.organization_id, name=settings.organization_name, slug="argo")
+        db.add(organization)
+        db.flush()
+    member_count = db.scalar(select(func.count()).select_from(models.User).where(models.User.organization_id == organization.id)) or 0
+    user = models.User(organization_id=organization.id, email=email, name=payload.name.strip(), password_hash=hash_password(payload.password), scopes=ADMIN_SCOPES if member_count == 0 else MEMBER_SCOPES)
+    db.add(user)
+    db.flush()
+    principal = Principal(user_id=user.id, organization_id=user.organization_id, scopes=set(user.scopes), name=user.name)
+    services.settings_for(db, principal)
+    db.commit()
+    return ok(auth_payload(user), request)
+
+
+@app.post("/api/v1/subscription/auth/login", tags=["Authentication"])
+def login(payload: schemas.LoginRequest, request: Request, db: DBSession) -> dict[str, Any]:
+    email = str(payload.email).lower()
+    user = db.scalar(select(models.User).where(func.lower(models.User.email) == email, models.User.status == "active"))
+    if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
-    return ok({"access_token": issue_token(user), "token_type": "bearer", "user": {"id": user["id"], "name": user["name"], "email": str(payload.email), "scopes": user["scopes"]}}, request)
+    return ok(auth_payload(user), request)
 
 
 @app.get("/api/v1/subscription/dashboard/summary", tags=["Dashboard"])
@@ -439,8 +459,8 @@ def create_attempt(payload: schemas.PaymentAttemptCreate, request: Request, db: 
     return ok(result, request)
 
 
-@app.post("/api/v1/subscription/payment-attempts/{attempt_id}/simulate-success", tags=["Payment Attempts"])
-def simulate_success(attempt_id: str, payload: schemas.SimulateSuccess, request: Request, db: DBSession, principal: BillingPrincipal, idempotency_key: Annotated[str | None, Header()] = None) -> dict[str, Any]:
+@app.post("/api/v1/subscription/payment-attempts/{attempt_id}/complete", tags=["Payment Attempts"])
+def complete_payment_attempt(attempt_id: str, payload: schemas.CompletePaymentAttempt, request: Request, db: DBSession, principal: BillingPrincipal, idempotency_key: Annotated[str | None, Header()] = None) -> dict[str, Any]:
     attempt = services.one(db, models.PaymentAttempt, principal.organization_id, attempt_id)
     if attempt.status != "pending":
         raise HTTPException(409, "Only pending attempts can be completed")

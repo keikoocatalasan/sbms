@@ -12,8 +12,8 @@ def client_and_token() -> tuple[TestClient, dict[str, str]]:
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     client = TestClient(app)
-    response = client.post("/api/v1/subscription/auth/login", json={"email": "admin@argo.demo", "password": "DemoPass123!"})
-    assert response.status_code == 200
+    response = client.post("/api/v1/subscription/auth/signup", json={"name": "Test Administrator", "email": "admin@example.com", "password": "LivePass123!"})
+    assert response.status_code == 201
     return client, {"Authorization": f"Bearer {response.json()['data']['access_token']}"}
 
 
@@ -48,6 +48,18 @@ def test_missing_authentication_is_structured() -> None:
     assert response.json()["error"]["code"] == "UNAUTHORIZED"
 
 
+def test_signup_and_live_login() -> None:
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    client = TestClient(app)
+    signup = client.post("/api/v1/subscription/auth/signup", json={"name": "Live User", "email": "live@example.com", "password": "LivePass123!"})
+    assert signup.status_code == 201
+    assert "subscription:admin" in signup.json()["data"]["user"]["scopes"]
+    login = client.post("/api/v1/subscription/auth/login", json={"email": "live@example.com", "password": "LivePass123!"})
+    assert login.status_code == 200
+    assert login.json()["data"]["user"]["email"] == "live@example.com"
+
+
 def test_plan_edit_invoice_detail_and_auto_renew() -> None:
     client, headers = client_and_token()
     customer = client.post("/api/v1/subscription/customers", headers=headers, json={"display_name": "Lifecycle Customer", "email": "lifecycle@example.com"}).json()["data"]
@@ -80,10 +92,10 @@ def test_scheduled_cancellation_can_be_revoked() -> None:
 
 def test_billing_role_is_limited_to_billing_workflows() -> None:
     client, _ = client_and_token()
-    login = client.post("/api/v1/subscription/auth/login", json={"email": "billing@argo.demo", "password": "DemoPass123!"})
-    billing_headers = {"Authorization": f"Bearer {login.json()['data']['access_token']}"}
+    signup = client.post("/api/v1/subscription/auth/signup", json={"name": "Read Only", "email": "reader@example.com", "password": "LivePass123!"})
+    billing_headers = {"Authorization": f"Bearer {signup.json()['data']['access_token']}"}
     assert client.get("/api/v1/subscription/settings", headers=billing_headers).status_code == 200
-    assert client.post("/api/v1/subscription/customers", headers=billing_headers, json={"display_name": "Billing Managed"}).status_code == 201
+    assert client.post("/api/v1/subscription/customers", headers=billing_headers, json={"display_name": "Billing Managed"}).status_code == 403
     assert client.patch("/api/v1/subscription/settings", headers=billing_headers, json={"invoice_due_days": 10}).status_code == 403
     assert client.post("/api/v1/subscription/plans", headers=billing_headers, json={"plan_code": "DENIED", "name": "Denied"}).status_code == 403
     assert client.get("/api/v1/subscription/reports/mrr", headers=billing_headers).status_code == 403

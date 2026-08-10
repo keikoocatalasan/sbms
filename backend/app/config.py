@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime configuration. PostgreSQL is used in deployment; SQLite keeps the demo runnable."""
+    """Runtime configuration for the live, database-backed service."""
 
     model_config = SettingsConfigDict(env_file=Path(__file__).parents[1] / ".env", extra="ignore")
 
@@ -14,7 +14,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 480
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    demo_mode: bool = True
+    organization_id: str = "00000000-0000-0000-0000-000000000001"
+    organization_name: str = "Argo Subscription Management"
 
     @property
     def origins(self) -> list[str]:

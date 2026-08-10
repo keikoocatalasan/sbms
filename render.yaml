@@ -17,5 +17,3 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
-      - key: DEMO_MODE
-        value: "true"

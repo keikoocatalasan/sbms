@@ -127,7 +127,7 @@ export function PaymentDialog({ onClose, onDone }: DialogProps) {
     <form onSubmit={submit} className="form-grid">
       <label>Customer<select required value={customerId} onChange={event => setCustomerId(event.target.value)}><option value="" disabled>Select customer</option>{customers.filter(customer => customer.status === 'active').map(customer => <option key={customer.id} value={customer.id}>{customer.display_name}</option>)}</select></label>
       <label>Invoice allocation<select value={invoiceId} onChange={event => chooseInvoice(event.target.value)} disabled={!customerId}><option value="">Unallocated account credit</option>{openInvoices.map(invoice => <option key={invoice.id} value={invoice.id}>{invoice.invoice_number} — {money(invoice.amounts.balance_minor, invoice.currency)} due</option>)}</select></label>
-      <label>Payment method<select name="payment_method" defaultValue="manual_bank"><option value="manual_bank">Bank transfer</option><option value="manual_cash">Cash</option><option value="simulated_card">Simulated card</option><option value="simulated_wallet">Simulated wallet</option></select></label>
+      <label>Payment method<select name="payment_method" defaultValue="manual_bank"><option value="manual_bank">Bank transfer</option><option value="manual_cash">Cash</option></select></label>
       <label>Amount (PHP)<input required type="number" min="0.01" step="0.01" value={amount} onChange={event => setAmount(event.target.value)}/></label>
       <label>Reference<input name="reference" maxLength={128} placeholder="BANK-2026-001"/></label>
       <label>Notes<input name="notes" maxLength={2000}/></label>

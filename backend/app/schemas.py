@@ -13,6 +13,12 @@ class LoginRequest(APIModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class SignupRequest(APIModel):
+    name: str = Field(min_length=2, max_length=160)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
+
 class CustomerCreate(APIModel):
     display_name: str = Field(min_length=1, max_length=160)
     customer_type: Literal["individual", "organization"] = "individual"
@@ -119,7 +125,7 @@ class AllocationInput(APIModel):
 
 class PaymentCreate(APIModel):
     customer_id: str
-    payment_method: Literal["manual_cash", "manual_bank", "simulated_card", "simulated_wallet"]
+    payment_method: Literal["manual_cash", "manual_bank"]
     amount_minor: int = Field(gt=0)
     currency: str = Field(default="PHP", pattern=r"^[A-Z]{3}$")
     received_at: datetime | None = None
@@ -130,13 +136,13 @@ class PaymentCreate(APIModel):
 
 class PaymentAttemptCreate(APIModel):
     invoice_id: str
-    provider: Literal["simulated"] = "simulated"
+    provider: Literal["manual"] = "manual"
     amount_minor: int = Field(gt=0)
     currency: str = Field(default="PHP", pattern=r"^[A-Z]{3}$")
 
 
-class SimulateSuccess(APIModel):
-    payment_method: Literal["simulated_card", "simulated_wallet"] = "simulated_card"
+class CompletePaymentAttempt(APIModel):
+    payment_method: Literal["manual_cash", "manual_bank"] = "manual_bank"
     external_reference: str | None = Field(default=None, max_length=128)
     received_at: datetime | None = None
     allocations: list[AllocationInput] = Field(default_factory=list)
