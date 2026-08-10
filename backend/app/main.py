@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 
 from . import models, schemas, services
 from .config import get_settings
-from .db import Base, engine
+from .db import Base, engine, secure_postgres_tables
 from .security import ADMIN_SCOPES, DBSession, MEMBER_SCOPES, Principal, current_principal, hash_password, issue_token, request_id, require_scope, verify_password
 
 
@@ -21,6 +21,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
+    secure_postgres_tables()
     yield
 
 
