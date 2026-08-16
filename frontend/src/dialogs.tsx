@@ -3,7 +3,7 @@ import { AlertCircle, LoaderCircle } from 'lucide-react'
 import { api, apiMessage, requestKey } from './api'
 import { downloadCsv, Modal, money, shortDate, Status } from './components'
 import { useAppData } from './app-data'
-import type { Customer, Envelope, Invoice, Plan, Subscription } from './types'
+import type { Customer, Envelope, Invoice, Payment, Plan, Subscription } from './types'
 
 type DialogProps = { onClose: () => void; onDone: (message: string) => Promise<void> | void }
 
@@ -42,6 +42,7 @@ export function CustomerDialog({ customer, onClose, onDone }: DialogProps & { cu
 }
 
 export function PlanDialog({ plan, onClose, onDone }: DialogProps & { plan?: Plan }) {
+  const { settings } = useAppData()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -53,7 +54,7 @@ export function PlanDialog({ plan, onClose, onDone }: DialogProps & { plan?: Pla
       } else {
         const code = String(form.get('plan_code')).trim().toUpperCase().replace(/[^A-Z0-9_-]+/g, '-')
         const created = await api.post<Envelope<Plan>>('/plans', { plan_code: code, name: form.get('name'), description: form.get('description') || null, trial_days: Number(form.get('trial_days')), is_featured: form.get('is_featured') === 'on' })
-        await api.post(`/plans/${created.data.data.id}/prices`, { price_code: `${code}-${String(form.get('billing_interval')).toUpperCase()}`, billing_interval: form.get('billing_interval'), currency: 'PHP', unit_amount_minor: Math.round(Number(form.get('amount')) * 100), setup_fee_minor: 0, is_default: true })
+        await api.post(`/plans/${created.data.data.id}/prices`, { price_code: `${code}-${String(form.get('billing_interval')).toUpperCase()}`, billing_interval: form.get('billing_interval'), currency: settings?.default_currency ?? 'PHP', unit_amount_minor: Math.round(Number(form.get('amount')) * 100), setup_fee_minor: 0, is_default: true })
         await api.patch(`/plans/${created.data.data.id}/status`, { status: 'active' })
       }
       await onDone(plan ? 'Plan details updated. Existing subscription prices were preserved.' : 'Plan and active price created.'); onClose()
@@ -65,11 +66,36 @@ export function PlanDialog({ plan, onClose, onDone }: DialogProps & { plan?: Pla
       <label>Plan name<input name="name" required maxLength={120} defaultValue={plan?.name}/></label>
       {!plan && <label>Plan code<input name="plan_code" required pattern="[A-Za-z0-9_-]+" placeholder="PROFESSIONAL"/></label>}
       {!plan && <label>Billing interval<select name="billing_interval" defaultValue="month"><option value="month">Monthly</option><option value="year">Annual</option></select></label>}
-      {!plan && <label>Price (PHP)<input name="amount" required type="number" min="0" step="0.01" defaultValue={price ? price.unit_amount_minor / 100 : ''}/></label>}
+      {!plan && <label>Price ({settings?.default_currency ?? 'PHP'})<input name="amount" required type="number" min="0" step="0.01" defaultValue={price ? price.unit_amount_minor / 100 : ''}/></label>}
       <label>Trial days<input name="trial_days" type="number" min="0" max="365" defaultValue={plan?.trial_days ?? 7}/></label>
       <label className="checkbox"><input name="is_featured" type="checkbox" defaultChecked={plan?.is_featured}/> Highlight this plan</label>
       <label className="span-2">Description and included features<textarea name="description" maxLength={2000} defaultValue={plan?.description ?? ''} placeholder="Describe the intended customer and included service."/></label>
       <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy}/></div>
+    </form>
+  </Modal>
+}
+
+export function PlanPriceDialog({ plan, onClose, onDone }: DialogProps & { plan: Plan }) {
+  const { settings } = useAppData()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    const form = new FormData(event.currentTarget)
+    try {
+      await api.post(`/plans/${plan.id}/prices`, { price_code: String(form.get('price_code')).trim().toUpperCase(), billing_interval: form.get('billing_interval'), interval_count: Number(form.get('interval_count')), currency: form.get('currency'), unit_amount_minor: Math.round(Number(form.get('amount')) * 100), setup_fee_minor: 0, is_default: form.get('is_default') === 'on' })
+      await onDone('New plan price created. Existing subscription prices were preserved.'); onClose()
+    } catch (caught) { setError(apiMessage(caught, 'Unable to create the plan price.')) } finally { setBusy(false) }
+  }
+  return <Modal title={`Add price to ${plan.name}`} description="Prices are immutable billing records. New subscriptions will use the active default price." onClose={onClose}>
+    <form onSubmit={submit} className="form-grid">
+      <label>Price code<input name="price_code" required pattern="[A-Za-z0-9_-]+" defaultValue={`${plan.plan_code}-MONTH-${Date.now().toString().slice(-4)}`}/></label>
+      <label>Billing interval<select name="billing_interval" defaultValue="month"><option value="month">Monthly</option><option value="year">Annual</option></select></label>
+      <label>Interval count<input name="interval_count" type="number" min="1" max="12" defaultValue="1"/></label>
+      <label>Currency<select name="currency" defaultValue={settings?.default_currency ?? 'PHP'}><option value="PHP">PHP — Philippine Peso</option><option value="USD">USD — US Dollar</option></select></label>
+      <label>Price ({settings?.default_currency ?? 'PHP'})<input name="amount" required type="number" min="0" step="0.01"/></label>
+      <label className="checkbox"><input name="is_default" type="checkbox" defaultChecked/> Make default for this interval</label>
+      <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Create price"/></div>
     </form>
   </Modal>
 }
@@ -100,13 +126,14 @@ export function SubscriptionDialog({ onClose, onDone }: DialogProps) {
 }
 
 export function PaymentDialog({ onClose, onDone }: DialogProps) {
-  const { customers, invoices } = useAppData()
+  const { customers, invoices, settings } = useAppData()
   const [customerId, setCustomerId] = useState('')
   const [invoiceId, setInvoiceId] = useState('')
   const [amount, setAmount] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const openInvoices = invoices.filter(invoice => invoice.customer_id === customerId && invoice.amounts.balance_minor > 0 && !['void', 'paid'].includes(invoice.status))
+  const openInvoices = invoices.filter(invoice => invoice.customer_id === customerId && invoice.amounts.balance_minor > 0 && invoice.status !== 'void')
+  const selectedInvoice = invoices.find(invoice => invoice.id === invoiceId)
   useEffect(() => { setInvoiceId(''); setAmount('') }, [customerId])
   function chooseInvoice(id: string) {
     setInvoiceId(id)
@@ -119,7 +146,7 @@ export function PaymentDialog({ onClose, onDone }: DialogProps) {
     const amountMinor = Math.round(Number(amount) * 100)
     const allocations = invoiceId ? [{ invoice_id: invoiceId, amount_minor: amountMinor }] : []
     try {
-      await api.post('/payments', { customer_id: customerId, payment_method: form.get('payment_method'), amount_minor: amountMinor, currency: 'PHP', external_reference: form.get('reference') || null, notes: form.get('notes') || null, allocations }, { headers: { 'Idempotency-Key': requestKey() } })
+      await api.post('/payments', { customer_id: customerId, payment_method: form.get('payment_method'), amount_minor: amountMinor, currency: selectedInvoice?.currency ?? settings?.default_currency ?? 'PHP', external_reference: form.get('reference') || null, notes: form.get('notes') || null, allocations }, { headers: { 'Idempotency-Key': requestKey() } })
       await onDone(invoiceId ? 'Payment recorded and allocated to the invoice.' : 'On-account payment recorded as unallocated credit.'); onClose()
     } catch (caught) { setError(apiMessage(caught, 'Unable to record the payment.')) } finally { setBusy(false) }
   }
@@ -128,7 +155,7 @@ export function PaymentDialog({ onClose, onDone }: DialogProps) {
       <label>Customer<select required value={customerId} onChange={event => setCustomerId(event.target.value)}><option value="" disabled>Select customer</option>{customers.filter(customer => customer.status === 'active').map(customer => <option key={customer.id} value={customer.id}>{customer.display_name}</option>)}</select></label>
       <label>Invoice allocation<select value={invoiceId} onChange={event => chooseInvoice(event.target.value)} disabled={!customerId}><option value="">Unallocated account credit</option>{openInvoices.map(invoice => <option key={invoice.id} value={invoice.id}>{invoice.invoice_number} — {money(invoice.amounts.balance_minor, invoice.currency)} due</option>)}</select></label>
       <label>Payment method<select name="payment_method" defaultValue="manual_bank"><option value="manual_bank">Bank transfer</option><option value="manual_cash">Cash</option></select></label>
-      <label>Amount (PHP)<input required type="number" min="0.01" step="0.01" value={amount} onChange={event => setAmount(event.target.value)}/></label>
+      <label>Amount ({selectedInvoice?.currency ?? settings?.default_currency ?? 'PHP'})<input required type="number" min="0.01" step="0.01" value={amount} onChange={event => setAmount(event.target.value)}/></label>
       <label>Reference<input name="reference" maxLength={128} placeholder="BANK-2026-001"/></label>
       <label>Notes<input name="notes" maxLength={2000}/></label>
       <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Record payment"/></div>
@@ -136,21 +163,54 @@ export function PaymentDialog({ onClose, onDone }: DialogProps) {
   </Modal>
 }
 
+export function PaymentAllocationDialog({ payment, onClose, onDone }: DialogProps & { payment: Payment }) {
+  const { customers, invoices, settings } = useAppData()
+  const [invoiceId, setInvoiceId] = useState('')
+  const [amount, setAmount] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const customer = customers.find(item => item.id === payment.customer_id)
+  const openInvoices = invoices.filter(invoice => invoice.customer_id === payment.customer_id && invoice.currency === payment.currency && invoice.amounts.balance_minor > 0 && invoice.status !== 'void')
+  const selectedInvoice = openInvoices.find(invoice => invoice.id === invoiceId)
+  useEffect(() => {
+    if (!selectedInvoice) { setAmount(''); return }
+    const maximum = Math.min(payment.unallocated_minor, selectedInvoice.amounts.balance_minor)
+    setAmount(String(maximum / 100))
+  }, [payment.unallocated_minor, selectedInvoice])
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    const amountMinor = Math.round(Number(amount) * 100)
+    try {
+      await api.post(`/payments/${payment.id}/allocate`, { allocations: [{ invoice_id: invoiceId, amount_minor: amountMinor }] }, { headers: { 'Idempotency-Key': requestKey() } })
+      await onDone('Existing payment credit allocated and billing status synchronized.'); onClose()
+    } catch (caught) { setError(apiMessage(caught, 'Unable to allocate the payment.')) } finally { setBusy(false) }
+  }
+  return <Modal title="Allocate payment credit" description={`Apply ${money(payment.unallocated_minor, payment.currency)} of ${customer?.display_name ?? 'this customer'}'s existing credit to an open invoice.`} onClose={onClose}>
+    <form onSubmit={submit} className="form-grid">
+      <label className="span-2">Invoice<select required value={invoiceId} onChange={event => setInvoiceId(event.target.value)}><option value="" disabled>Select open invoice</option>{openInvoices.map(invoice => <option key={invoice.id} value={invoice.id}>{invoice.invoice_number} — {money(invoice.amounts.balance_minor, invoice.currency)} due</option>)}</select></label>
+      <label>Amount ({payment.currency})<input required type="number" min="0.01" step="0.01" max={selectedInvoice ? Math.min(payment.unallocated_minor, selectedInvoice.amounts.balance_minor) / 100 : undefined} value={amount} onChange={event => setAmount(event.target.value)} disabled={!selectedInvoice}/></label>
+      <p className="form-hint">{settings?.allow_partial_payments === false ? 'Partial payments are disabled; the full invoice balance is required.' : 'A fully allocated invoice activates a pending subscription.'}</p>
+      {!openInvoices.length && <FormError message="No open invoice matches this payment's customer and currency."/>}
+      <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Allocate credit"/></div>
+    </form>
+  </Modal>
+}
+
 export function InvoiceDialog({ onClose, onDone }: DialogProps) {
-  const { customers } = useAppData()
+  const { customers, settings } = useAppData()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError('')
     const form = new FormData(event.currentTarget)
     try {
-      await api.post('/invoices', { customer_id: form.get('customer_id'), issue_date: new Date().toISOString().slice(0, 10), due_date: form.get('due_date'), currency: 'PHP', notes: form.get('notes') || null, items: [{ item_type: 'adjustment', description: form.get('description'), quantity: 1, unit_amount_minor: Math.round(Number(form.get('amount')) * 100), tax_rate_bps: 0 }] }, { headers: { 'Idempotency-Key': requestKey() } })
+      await api.post('/invoices', { customer_id: form.get('customer_id'), issue_date: new Date().toISOString().slice(0, 10), due_date: form.get('due_date'), currency: settings?.default_currency ?? 'PHP', notes: form.get('notes') || null, items: [{ item_type: 'adjustment', description: form.get('description'), quantity: 1, unit_amount_minor: Math.round(Number(form.get('amount')) * 100), tax_rate_bps: 0 }] }, { headers: { 'Idempotency-Key': requestKey() } })
       await onDone('Draft invoice created. Finalize it when ready to send.'); onClose()
     } catch (caught) { setError(apiMessage(caught, 'Unable to create the invoice.')) } finally { setBusy(false) }
   }
-  const due = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10)
+  const due = new Date(Date.now() + (settings?.invoice_due_days ?? 7) * 86400000).toISOString().slice(0, 10)
   return <Modal title="Generate invoice" description="Manual invoices start as drafts so they can be reviewed before finalization." onClose={onClose}>
-    <form onSubmit={submit} className="form-grid"><label>Customer<select name="customer_id" required defaultValue=""><option value="" disabled>Select customer</option>{customers.filter(customer => customer.status === 'active').map(customer => <option key={customer.id} value={customer.id}>{customer.display_name}</option>)}</select></label><label>Due date<input name="due_date" type="date" required defaultValue={due}/></label><label className="span-2">Description<input name="description" required maxLength={255}/></label><label>Amount (PHP)<input name="amount" required type="number" min="0" step="0.01"/></label><label>Notes<input name="notes" maxLength={2000}/></label><FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Create draft"/></div></form>
+    <form onSubmit={submit} className="form-grid"><label>Customer<select name="customer_id" required defaultValue=""><option value="" disabled>Select customer</option>{customers.filter(customer => customer.status === 'active').map(customer => <option key={customer.id} value={customer.id}>{customer.display_name}</option>)}</select></label><label>Due date<input name="due_date" type="date" required defaultValue={due}/></label><label className="span-2">Description<input name="description" required maxLength={255}/></label><label>Amount ({settings?.default_currency ?? 'PHP'})<input name="amount" required type="number" min="0" step="0.01"/></label><label>Notes<input name="notes" maxLength={2000}/></label><FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Create draft"/></div></form>
   </Modal>
 }
 
@@ -166,8 +226,8 @@ export function NotificationDialog({ onClose, onDone }: DialogProps) {
       await onDone('Notification created.'); onClose()
     } catch (caught) { setError(apiMessage(caught, 'Unable to create the notification.')) } finally { setBusy(false) }
   }
-  return <Modal title="New notification" description="Create an in-app notice for one customer or the whole account." onClose={onClose}>
-    <form onSubmit={submit} className="form-grid"><label>Recipient<select name="customer_id"><option value="">All users</option>{customers.map(customer => <option key={customer.id} value={customer.id}>{customer.display_name}</option>)}</select></label><label>Type<select name="notification_type" defaultValue="manual_notice"><option value="manual_notice">General notice</option><option value="payment_reminder">Payment reminder</option><option value="subscription_update">Subscription update</option></select></label><label className="span-2">Title<input name="title" required maxLength={160}/></label><label className="span-2">Message<textarea name="body" required maxLength={4000}/></label><FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy}/></div></form>
+  return <Modal title="New notification" description="Create an in-app notice for all account users or attach it to a customer record." onClose={onClose}>
+    <form onSubmit={submit} className="form-grid"><label>Audience<select name="customer_id"><option value="">All account users</option>{customers.map(customer => <option key={customer.id} value={customer.id}>Customer context: {customer.display_name}</option>)}</select></label><label>Type<select name="notification_type" defaultValue="manual_notice"><option value="manual_notice">General notice</option><option value="payment_reminder">Payment reminder</option><option value="subscription_update">Subscription update</option></select></label><label className="span-2">Title<input name="title" required maxLength={160}/></label><label className="span-2">Message<textarea name="body" required maxLength={4000}/></label><FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy}/></div></form>
   </Modal>
 }
 
@@ -199,8 +259,9 @@ export function CustomerProfileDialog({ customer, onClose }: { customer: Custome
   const customerSubscriptions = subscriptions.filter(item => item.customer_id === customer.id)
   const customerInvoices = invoices.filter(item => item.customer_id === customer.id)
   const customerPayments = payments.filter(item => item.customer_id === customer.id)
+  const paidTotal = customerPayments.reduce((sum, item) => sum + (item.status === 'completed' ? item.amount_minor - item.unallocated_minor : 0), 0)
   return <Modal title={customer.display_name} description={`${customer.customer_code} · ${customer.email ?? 'No email'}`} onClose={onClose} wide>
-    <div className="detail-grid"><section><h3>Subscriptions</h3>{customerSubscriptions.length ? customerSubscriptions.map(item => <div className="detail-line" key={item.id}><span>{plans.find(plan => plan.id === item.plan_id)?.name ?? item.subscription_number}</span><Status>{item.status}</Status></div>) : <p>No subscriptions.</p>}</section><section><h3>Billing</h3><div className="detail-line"><span>Invoices</span><b>{customerInvoices.length}</b></div><div className="detail-line"><span>Paid total</span><b>{money(customerPayments.reduce((sum, item) => sum + item.amount_minor - item.unallocated_minor, 0))}</b></div><div className="detail-line"><span>Outstanding</span><b>{money(customerInvoices.reduce((sum, item) => sum + item.amounts.balance_minor, 0))}</b></div></section></div>
+    <div className="detail-grid"><section><h3>Subscriptions</h3>{customerSubscriptions.length ? customerSubscriptions.map(item => <div className="detail-line" key={item.id}><span>{plans.find(plan => plan.id === item.plan_id)?.name ?? item.subscription_number}</span><Status>{item.status}</Status></div>) : <p>No subscriptions.</p>}</section><section><h3>Billing</h3><div className="detail-line"><span>Invoices</span><b>{customerInvoices.length}</b></div><div className="detail-line"><span>Paid total</span><b>{money(paidTotal)}</b></div><div className="detail-line"><span>Outstanding</span><b>{money(customerInvoices.reduce((sum, item) => sum + item.amounts.balance_minor, 0))}</b></div></section></div>
   </Modal>
 }
 

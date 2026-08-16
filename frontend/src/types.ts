@@ -88,6 +88,7 @@ export type Payment = BaseRecord & {
   currency: string
   received_at: string
   external_reference: string | null
+  allocated_minor?: number
   unallocated_minor: number
 }
 
@@ -139,4 +140,3 @@ export type MrrReport = {
   active_subscription_count: number
   calculation: string
 }
-

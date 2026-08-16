@@ -79,6 +79,8 @@ POST /auth/login          Authenticate a live account and return a JWT
 | `/subscriptions/{id}/schedule-plan-change` | POST | Schedule an upgrade/downgrade |
 | `/invoices` | GET, POST | List or create invoices |
 | `/payments` | GET, POST | List or record payments |
+| `/payments/{id}/allocate` | POST | Apply an existing account credit to an invoice and synchronize its subscription |
+| `/payments/{id}/void` | POST | Void a fully unallocated payment (administrator only) |
 | `/notifications` | GET, POST | List or create notifications |
 | `/settings` | GET, PATCH | Read or update organization settings |
 | `/reports/mrr` | GET | Monthly recurring revenue |

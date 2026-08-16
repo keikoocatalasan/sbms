@@ -21,6 +21,19 @@ type AppDataValue = {
 
 const AppDataContext = createContext<AppDataValue | null>(null)
 
+async function fetchAll<T>(path: string, pageSize = 100) {
+  const rows: T[] = []
+  let page = 1
+  let totalPages: number
+  do {
+    const response = await api.get<Envelope<T[]>>(`${path}?page=${page}&page_size=${pageSize}`)
+    rows.push(...response.data.data)
+    totalPages = Number(response.data.meta.total_pages ?? 1)
+    page += 1
+  } while (page <= totalPages)
+  return rows
+}
+
 export function AppDataProvider({ user, children }: { user: AuthUser; children: React.ReactNode }) {
   const [customers, setCustomers] = useState<Customer[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
@@ -42,21 +55,21 @@ export function AppDataProvider({ user, children }: { user: AuthUser; children: 
     try {
       const common = await Promise.all([
         api.get<Envelope<DashboardSummary>>('/dashboard/summary'),
-        api.get<Envelope<Customer[]>>('/customers?page_size=100'),
-        api.get<Envelope<Plan[]>>('/plans?page_size=100'),
-        api.get<Envelope<Subscription[]>>('/subscriptions?page_size=100'),
-        api.get<Envelope<Invoice[]>>('/invoices?page_size=100'),
-        api.get<Envelope<Payment[]>>('/payments?page_size=100'),
-        api.get<Envelope<Notification[]>>('/notifications?page_size=100'),
+        fetchAll<Customer>('/customers'),
+        fetchAll<Plan>('/plans'),
+        fetchAll<Subscription>('/subscriptions'),
+        fetchAll<Invoice>('/invoices'),
+        fetchAll<Payment>('/payments'),
+        fetchAll<Notification>('/notifications'),
         api.get<Envelope<SystemSettings>>('/settings'),
       ])
       setSummary(common[0].data.data)
-      setCustomers(common[1].data.data)
-      setPlans(common[2].data.data)
-      setSubscriptions(common[3].data.data)
-      setInvoices(common[4].data.data)
-      setPayments(common[5].data.data)
-      setNotifications(common[6].data.data)
+      setCustomers(common[1])
+      setPlans(common[2])
+      setSubscriptions(common[3])
+      setInvoices(common[4])
+      setPayments(common[5])
+      setNotifications(common[6])
       setSettings(common[7].data.data)
       if (can('subscription:reports')) {
         const report = await api.get<Envelope<MrrReport>>('/reports/mrr')

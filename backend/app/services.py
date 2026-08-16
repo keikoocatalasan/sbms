@@ -63,13 +63,29 @@ def notification(session: Session, principal: Principal, title: str, body: str, 
 def invoice_amounts(session: Session, invoice: models.Invoice) -> dict[str, int]:
     item_total = session.scalar(select(func.coalesce(func.sum(models.InvoiceItem.quantity * models.InvoiceItem.unit_amount_minor), 0)).where(models.InvoiceItem.invoice_id == invoice.id, models.InvoiceItem.organization_id == invoice.organization_id)) or 0
     paid = session.scalar(select(func.coalesce(func.sum(models.PaymentAllocation.amount_minor), 0)).join(models.Payment).where(models.PaymentAllocation.invoice_id == invoice.id, models.PaymentAllocation.organization_id == invoice.organization_id, models.Payment.status == "completed")) or 0
-    balance = 0 if invoice.status == "void" else int(item_total - paid)
+    balance = 0 if invoice.status == "void" else max(0, int(item_total - paid))
     return {"total_minor": int(item_total), "paid_minor": int(paid), "balance_minor": balance}
 
 
 def invoice_public(session: Session, invoice: models.Invoice) -> dict[str, Any]:
     payload = public(invoice)
-    payload["amounts"] = invoice_amounts(session, invoice)
+    amounts = invoice_amounts(session, invoice)
+    payload["amounts"] = amounts
+    # Expose the state implied by the ledger, even when an older import left
+    # the stored status behind the payment allocations.
+    if invoice.status not in {"draft", "void"}:
+        payload["status"] = "paid" if amounts["balance_minor"] <= 0 else "overdue" if invoice.due_date < date.today() else "open"
+    return payload
+
+
+def payment_allocated_amount(session: Session, payment: models.Payment) -> int:
+    return int(session.scalar(select(func.coalesce(func.sum(models.PaymentAllocation.amount_minor), 0)).where(models.PaymentAllocation.payment_id == payment.id, models.PaymentAllocation.organization_id == payment.organization_id)) or 0)
+
+
+def payment_public(session: Session, payment: models.Payment) -> dict[str, Any]:
+    payload = public(payment)
+    payload["allocated_minor"] = payment_allocated_amount(session, payment)
+    payload["unallocated_minor"] = max(0, payment.amount_minor - payload["allocated_minor"])
     return payload
 
 
@@ -92,6 +108,7 @@ def activate_subscription_for_invoice(session: Session, principal: Principal, in
     if subscription.status in {"pending_payment", "past_due", "suspended"}:
         previous = subscription.status
         subscription.status = "active"
+        subscription.updated_by = principal.user_id
         subscription.version += 1
         event(session, principal, subscription, "payment_activated", previous, "Payment settled", request_id)
 
@@ -106,6 +123,7 @@ def create_invoice_for_subscription(session: Session, principal: Principal, subs
     session.add(models.InvoiceItem(organization_id=principal.organization_id, invoice_id=invoice.id, line_number=1, item_type="recurring", description=f"Subscription renewal ({price.billing_interval})", quantity=1, unit_amount_minor=price.unit_amount_minor + price.setup_fee_minor, tax_rate_bps=0, service_period_start=invoice.service_period_start, service_period_end=invoice.service_period_end, plan_id=subscription.plan_id, plan_price_id=price.id, created_by=principal.user_id, updated_by=principal.user_id))
     session.flush()
     activity(session, principal, "invoice", invoice.id, "created_from_subscription", request_id)
+    apply_unallocated_credits(session, principal, subscription.customer_id, invoice.currency, request_id, invoice.id)
     return invoice
 
 
@@ -141,9 +159,55 @@ def complete_idempotency(session: Session, principal: Principal, operation: str,
         record.result_json, record.resource_type, record.resource_id, record.response_status = result, resource_type, resource_id, response_status
 
 
+def apply_unallocated_credits(session: Session, principal: Principal, customer_id: str, currency: str, request_id: str, invoice_id: str | None = None) -> int:
+    """Apply existing completed account credit to the oldest collectible invoices."""
+    settings = settings_for(session, principal)
+    invoice_filters = [
+        models.Invoice.organization_id == principal.organization_id,
+        models.Invoice.customer_id == customer_id,
+        models.Invoice.currency == currency,
+        # A legacy paid row can still carry a balance when the original
+        # allocation was recorded out of order. Keep it collectible until
+        # the balance is actually settled and sync_invoice can canonicalize it.
+        models.Invoice.status.in_(["open", "overdue", "paid"]),
+    ]
+    if invoice_id:
+        invoice_filters.append(models.Invoice.id == invoice_id)
+    invoices = session.scalars(select(models.Invoice).where(*invoice_filters).order_by(models.Invoice.due_date, models.Invoice.created_at)).all()
+    if not invoices:
+        return 0
+    payments = session.scalars(select(models.Payment).where(models.Payment.organization_id == principal.organization_id, models.Payment.customer_id == customer_id, models.Payment.currency == currency, models.Payment.status == "completed").order_by(models.Payment.received_at, models.Payment.created_at)).all()
+    applied = 0
+    for payment in payments:
+        remaining = payment.amount_minor - payment_allocated_amount(session, payment)
+        if remaining <= 0:
+            continue
+        for invoice in invoices:
+            if remaining <= 0:
+                break
+            balance = invoice_amounts(session, invoice)["balance_minor"]
+            if balance <= 0:
+                continue
+            if not settings.allow_partial_payments and remaining < balance:
+                continue
+            amount = min(remaining, balance)
+            session.add(models.PaymentAllocation(organization_id=principal.organization_id, payment_id=payment.id, invoice_id=invoice.id, amount_minor=amount, created_by=principal.user_id, updated_by=principal.user_id))
+            session.flush()
+            sync_invoice(session, invoice)
+            activate_subscription_for_invoice(session, principal, invoice, request_id)
+            remaining -= amount
+            applied += amount
+    return applied
+
+
 def allocate(session: Session, principal: Principal, payment: models.Payment, allocations: list[dict[str, Any]], request_id: str) -> None:
-    allocated = session.scalar(select(func.coalesce(func.sum(models.PaymentAllocation.amount_minor), 0)).where(models.PaymentAllocation.payment_id == payment.id)) or 0
+    if payment.status != "completed":
+        raise HTTPException(409, "Only completed payments can be allocated")
+    settings = settings_for(session, principal)
+    allocated = payment_allocated_amount(session, payment)
     requested = sum(int(a["amount_minor"]) for a in allocations)
+    if not requested:
+        return
     if allocated + requested > payment.amount_minor:
         raise HTTPException(409, "Allocations exceed the payment amount")
     for input_item in allocations:
@@ -153,6 +217,8 @@ def allocate(session: Session, principal: Principal, payment: models.Payment, al
         balance = invoice_amounts(session, invoice)["balance_minor"]
         if input_item["amount_minor"] > balance:
             raise HTTPException(409, "Allocation exceeds invoice balance")
+        if not settings.allow_partial_payments and input_item["amount_minor"] != balance:
+            raise HTTPException(409, "Partial payments are disabled; allocate the full invoice balance")
         session.add(models.PaymentAllocation(organization_id=principal.organization_id, payment_id=payment.id, invoice_id=invoice.id, amount_minor=input_item["amount_minor"], created_by=principal.user_id, updated_by=principal.user_id))
         session.flush()
         sync_invoice(session, invoice)

@@ -39,6 +39,29 @@ def test_subscription_to_payment_activation_and_idempotency() -> None:
     assert payment.status_code == 201
     invoices = client.get("/api/v1/subscription/invoices", headers=headers).json()["data"]
     assert invoices[0]["status"] == "paid"
+    subscriptions = client.get("/api/v1/subscription/subscriptions", headers=headers).json()["data"]
+    assert subscriptions[0]["status"] == "active"
+    assert subscriptions[0]["next_billing_at"] == subscriptions[0]["current_period_end"]
+
+
+def test_existing_payment_credit_can_be_allocated_once_and_sync_subscription() -> None:
+    client, headers = client_and_token()
+    customer = client.post("/api/v1/subscription/customers", headers=headers, json={"display_name": "Credit Customer"}).json()["data"]
+    _, price_id = active_price(client, headers)
+    created = client.post("/api/v1/subscription/subscriptions", headers={**headers, "Idempotency-Key": "credit-subscription"}, json={"customer_id": customer["id"], "plan_price_id": price_id, "starts_at": "2026-07-30T00:00:00Z", "use_trial": False}).json()["data"]
+    invoice = created["invoice"]
+    payment = client.post("/api/v1/subscription/payments", headers={**headers, "Idempotency-Key": "credit-payment"}, json={"customer_id": customer["id"], "payment_method": "manual_bank", "amount_minor": invoice["amounts"]["total_minor"], "currency": "PHP", "allocations": []}).json()["data"]
+    assert payment["unallocated_minor"] == invoice["amounts"]["total_minor"]
+    allocation_headers = {**headers, "Idempotency-Key": "credit-allocation"}
+    allocated = client.post(f"/api/v1/subscription/payments/{payment['id']}/allocate", headers=allocation_headers, json={"allocations": [{"invoice_id": invoice["id"], "amount_minor": invoice["amounts"]["total_minor"]}]})
+    assert allocated.status_code == 200
+    assert allocated.json()["data"]["unallocated_minor"] == 0
+    replay = client.post(f"/api/v1/subscription/payments/{payment['id']}/allocate", headers=allocation_headers, json={"allocations": [{"invoice_id": invoice["id"], "amount_minor": invoice["amounts"]["total_minor"]}]})
+    assert replay.status_code == 200 and replay.json()["meta"]["idempotent_replay"] is True
+    invoice_after = client.get(f"/api/v1/subscription/invoices/{invoice['id']}", headers=headers).json()["data"]
+    subscription_after = client.get("/api/v1/subscription/subscriptions", headers=headers).json()["data"][0]
+    assert invoice_after["status"] == "paid" and invoice_after["amounts"]["balance_minor"] == 0
+    assert subscription_after["status"] == "active"
 
 
 def test_missing_authentication_is_structured() -> None:

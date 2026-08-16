@@ -259,7 +259,7 @@ def create_subscription(payload: schemas.SubscriptionCreate, request: Request, d
         raise HTTPException(409, "The customer already has an open subscription to this price")
     start, end = services.subscription_period(payload.starts_at, price)
     trial = payload.use_trial and plan.trial_days > 0
-    subscription = models.Subscription(organization_id=principal.organization_id, subscription_number=services.reference(services.settings_for(db, principal).subscription_prefix, str(uuid.uuid4())), customer_id=customer.id, plan_id=plan.id, plan_price_id=price.id, status="trialing" if trial else "pending_payment", starts_at=payload.starts_at, trial_start_at=payload.starts_at if trial else None, trial_end_at=payload.starts_at + timedelta(days=plan.trial_days) if trial else None, current_period_start=None if trial else start, current_period_end=None if trial else end, next_billing_at=(payload.starts_at + timedelta(days=plan.trial_days)) if trial else start, auto_renew=payload.auto_renew, created_by=principal.user_id, updated_by=principal.user_id)
+    subscription = models.Subscription(organization_id=principal.organization_id, subscription_number=services.reference(services.settings_for(db, principal).subscription_prefix, str(uuid.uuid4())), customer_id=customer.id, plan_id=plan.id, plan_price_id=price.id, status="trialing" if trial else "pending_payment", starts_at=payload.starts_at, trial_start_at=payload.starts_at if trial else None, trial_end_at=payload.starts_at + timedelta(days=plan.trial_days) if trial else None, current_period_start=None if trial else start, current_period_end=None if trial else end, next_billing_at=(payload.starts_at + timedelta(days=plan.trial_days)) if trial else end, auto_renew=payload.auto_renew, created_by=principal.user_id, updated_by=principal.user_id)
     db.add(subscription)
     db.flush()
     invoice = None
@@ -396,6 +396,7 @@ def finalize_invoice(invoice_id: str, request: Request, db: DBSession, principal
         raise HTTPException(409, "An invoice total cannot be negative")
     invoice.finalized_at, invoice.status = services.now(), "open"
     services.sync_invoice(db, invoice)
+    services.apply_unallocated_credits(db, principal, invoice.customer_id, invoice.currency, request_id(request), invoice.id)
     services.activity(db, principal, "invoice", invoice.id, "finalized", request_id(request))
     db.commit()
     return ok(services.invoice_public(db, invoice), request)
@@ -415,12 +416,7 @@ def void_invoice(invoice_id: str, payload: schemas.VersionedCommand, request: Re
 @app.get("/api/v1/subscription/payments", tags=["Payments"])
 def payments(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 20) -> dict[str, Any]:
     rows, total = services.list_page(db, models.Payment, principal.organization_id, page, min(page_size, 100))
-    def serializer(payment: models.Payment) -> dict[str, Any]:
-        result = services.public(payment)
-        allocated = db.scalar(select(func.coalesce(func.sum(models.PaymentAllocation.amount_minor), 0)).where(models.PaymentAllocation.payment_id == payment.id)) or 0
-        result["unallocated_minor"] = payment.amount_minor - allocated
-        return result
-    return paged(rows, total, page, min(page_size, 100), request, serializer)
+    return paged(rows, total, page, min(page_size, 100), request, lambda payment: services.payment_public(db, payment))
 
 
 def make_payment(payload: schemas.PaymentCreate, request: Request, db: DBSession, principal: BillingPrincipal, attempt_id: str | None = None) -> models.Payment:
@@ -438,8 +434,40 @@ def record_payment(payload: schemas.PaymentCreate, request: Request, db: DBSessi
     if replay:
         return ok(replay, request, {"idempotent_replay": True})
     payment = make_payment(payload, request, db, principal)
-    result = services.public(payment)
+    result = services.payment_public(db, payment)
     services.complete_idempotency(db, principal, "payment.create", idempotency_key or "", result, "payment", payment.id)
+    db.commit()
+    return ok(result, request)
+
+
+@app.post("/api/v1/subscription/payments/{payment_id}/allocate", tags=["Payments"])
+def allocate_payment(payment_id: str, payload: schemas.PaymentAllocationCommand, request: Request, db: DBSession, principal: BillingPrincipal, idempotency_key: Annotated[str | None, Header()] = None) -> dict[str, Any]:
+    replay = services.claim_idempotency(db, principal, "payment.allocate", idempotency_key, {"payment_id": payment_id, **payload.model_dump()})
+    if replay:
+        return ok(replay, request, {"idempotent_replay": True})
+    payment = services.one(db, models.Payment, principal.organization_id, payment_id)
+    services.allocate(db, principal, payment, [item.model_dump() for item in payload.allocations], request_id(request))
+    services.activity(db, principal, "payment", payment.id, "allocated", request_id(request))
+    result = services.payment_public(db, payment)
+    services.complete_idempotency(db, principal, "payment.allocate", idempotency_key or "", result, "payment", payment.id)
+    db.commit()
+    return ok(result, request)
+
+
+@app.post("/api/v1/subscription/payments/{payment_id}/void", tags=["Payments"])
+def void_payment(payment_id: str, payload: schemas.PaymentVoidCommand, request: Request, db: DBSession, principal: AdminPrincipal, idempotency_key: Annotated[str | None, Header()] = None) -> dict[str, Any]:
+    replay = services.claim_idempotency(db, principal, "payment.void", idempotency_key, {"payment_id": payment_id, **payload.model_dump()})
+    if replay:
+        return ok(replay, request, {"idempotent_replay": True})
+    payment = services.one(db, models.Payment, principal.organization_id, payment_id)
+    if payment.status == "void":
+        raise HTTPException(409, "This payment has already been voided")
+    if services.payment_allocated_amount(db, payment):
+        raise HTTPException(409, "Allocated payments must be unallocated before they can be voided")
+    payment.status, payment.voided_at, payment.void_reason, payment.updated_by = "void", services.now(), payload.reason, principal.user_id
+    services.activity(db, principal, "payment", payment.id, "voided", request_id(request))
+    result = services.payment_public(db, payment)
+    services.complete_idempotency(db, principal, "payment.void", idempotency_key or "", result, "payment", payment.id)
     db.commit()
     return ok(result, request)
 
@@ -475,14 +503,25 @@ def complete_payment_attempt(attempt_id: str, payload: schemas.CompletePaymentAt
 
 @app.get("/api/v1/subscription/notifications", tags=["Notifications"])
 def notifications(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 20) -> dict[str, Any]:
-    rows, total = services.list_page(db, models.Notification, principal.organization_id, page, min(page_size, 100))
-    return paged(rows, total, page, min(page_size, 100), request)
+    page_size = min(page_size, 100)
+    filters = [models.Notification.organization_id == principal.organization_id]
+    if "subscription:admin" not in principal.scopes:
+        filters.append(models.Notification.recipient_user_id.is_(None) | (models.Notification.recipient_user_id == principal.user_id))
+    total = db.scalar(select(func.count()).select_from(models.Notification).where(*filters)) or 0
+    rows = db.scalars(select(models.Notification).where(*filters).order_by(models.Notification.created_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
+    return paged(list(rows), total, page, page_size, request)
 
 
 @app.post("/api/v1/subscription/notifications", status_code=201, tags=["Notifications"])
 def create_notification(payload: schemas.NotificationCreate, request: Request, db: DBSession, principal: BillingPrincipal) -> dict[str, Any]:
+    if not services.settings_for(db, principal).enable_in_app_notifications:
+        raise HTTPException(409, "In-app notifications are disabled")
     values = payload.model_dump()
-    values["recipient_user_id"] = payload.recipient_user_id or principal.user_id
+    if payload.recipient_user_id:
+        recipient = db.scalar(select(models.User).where(models.User.id == payload.recipient_user_id, models.User.organization_id == principal.organization_id, models.User.status == "active"))
+        if not recipient:
+            raise HTTPException(404, "Notification recipient not found")
+    values["recipient_user_id"] = payload.recipient_user_id
     notice = models.Notification(organization_id=principal.organization_id, **values, channel="in_app", status="sent", created_by=principal.user_id, updated_by=principal.user_id)
     db.add(notice); db.commit()
     return ok(services.public(notice), request)
@@ -527,7 +566,8 @@ def report_mrr(request: Request, db: DBSession, principal: ReportsPrincipal, cur
             at_risk += value
         else:
             mrr += value
-    return ok({"as_of": datetime.now(timezone.utc).date().isoformat(), "currency": currency, "mrr_minor": mrr, "at_risk_mrr_minor": at_risk, "active_subscription_count": len(subscriptions), "calculation": "active monthly amount + annual amount / 12"}, request)
+    active_count = sum(1 for sub in subscriptions if sub.status == "active")
+    return ok({"as_of": datetime.now(timezone.utc).date().isoformat(), "currency": currency, "mrr_minor": mrr, "at_risk_mrr_minor": at_risk, "active_subscription_count": active_count, "calculation": "active monthly amount + annual amount / 12; trialing subscriptions are included in MRR"}, request)
 
 
 @app.get("/api/v1/subscription/reports/collected-revenue", tags=["Reports"])
@@ -548,38 +588,89 @@ def process_due(payload: schemas.DueProcess, request: Request, db: DBSession, pr
     if replay:
         return ok(replay, request, {"idempotent_replay": True})
     as_of = payload.as_of or services.now()
-    result = {"processed": 0, "skipped": 0, "failed": 0, "created_invoices": 0, "marked_overdue": 0, "activated": 0, "suspended": 0, "cancelled": 0, "has_more": False}
-    due = db.scalars(select(models.Subscription).where(models.Subscription.organization_id == principal.organization_id, models.Subscription.next_billing_at.is_not(None), models.Subscription.next_billing_at <= as_of, models.Subscription.status.in_(["trialing", "active", "pending_payment", "past_due", "suspended"])).order_by(models.Subscription.next_billing_at).limit(payload.batch_size + 1)).all()
+    settings_row = services.settings_for(db, principal)
+    result = {"processed": 0, "skipped": 0, "failed": 0, "created_invoices": 0, "marked_overdue": 0, "activated": 0, "suspended": 0, "cancelled": 0, "expired": 0, "has_more": False}
+
+    overdue_invoices = db.scalars(select(models.Invoice).where(models.Invoice.organization_id == principal.organization_id, models.Invoice.status.in_(["open", "overdue"]), models.Invoice.due_date < as_of.date())).all()
+    for invoice in overdue_invoices:
+        was_overdue = invoice.status == "overdue"
+        if not payload.dry_run:
+            services.sync_invoice(db, invoice)
+        if not was_overdue:
+            result["marked_overdue"] += 1
+        if not invoice.subscription_id:
+            continue
+        subscription = services.one(db, models.Subscription, principal.organization_id, invoice.subscription_id)
+        previous = subscription.status
+        target_status: str | None = None
+        if subscription.status in {"active", "pending_payment"}:
+            target_status = "past_due"
+        elif subscription.status == "past_due" and invoice.due_date + timedelta(days=settings_row.grace_period_days) < as_of.date():
+            target_status = "suspended"
+        if target_status and not payload.dry_run:
+            subscription.status, subscription.next_billing_at, subscription.updated_by = target_status, None, principal.user_id
+            subscription.version += 1
+            services.event(db, principal, subscription, "payment_overdue", previous, "Invoice is overdue", request_id(request))
+            if target_status == "suspended":
+                result["suspended"] += 1
+
+    due = db.scalars(select(models.Subscription).where(models.Subscription.organization_id == principal.organization_id, models.Subscription.next_billing_at.is_not(None), models.Subscription.next_billing_at <= as_of, models.Subscription.status.in_(["trialing", "active"])).order_by(models.Subscription.next_billing_at).limit(payload.batch_size + 1)).all()
     result["has_more"] = len(due) > payload.batch_size
     for subscription in due[:payload.batch_size]:
         result["processed"] += 1
         previous = subscription.status
+        changed = False
         if subscription.status == "trialing":
-            subscription.status = "pending_payment"
-            price = services.one(db, models.PlanPrice, principal.organization_id, subscription.plan_price_id)
-            start, end = services.subscription_period(subscription.trial_end_at or as_of, price)
-            subscription.current_period_start, subscription.current_period_end, subscription.next_billing_at = start, end, start
-            if not payload.dry_run:
-                services.create_invoice_for_subscription(db, principal, subscription, as_of, request_id(request)); result["created_invoices"] += 1
+            if subscription.cancel_at_period_end:
+                if not payload.dry_run:
+                    subscription.status, subscription.ended_at, subscription.auto_renew, subscription.updated_by = "cancelled", as_of, False, principal.user_id
+                result["cancelled"] += 1
+                changed = True
+            elif not subscription.auto_renew:
+                if not payload.dry_run:
+                    subscription.status, subscription.ended_at, subscription.next_billing_at, subscription.updated_by = "expired", as_of, None, principal.user_id
+                result["expired"] += 1
+                changed = True
+            else:
+                price = services.one(db, models.PlanPrice, principal.organization_id, subscription.plan_price_id)
+                start, end = services.subscription_period(subscription.trial_end_at or as_of, price)
+                if not payload.dry_run:
+                    subscription.status = "pending_payment"
+                    subscription.current_period_start, subscription.current_period_end, subscription.next_billing_at = start, end, end
+                    subscription.updated_by = principal.user_id
+                if settings_row.auto_generate_invoices:
+                    result["created_invoices"] += 1
+                    if not payload.dry_run:
+                        services.create_invoice_for_subscription(db, principal, subscription, as_of, request_id(request))
+                changed = True
         elif subscription.cancel_at_period_end:
-            subscription.status, subscription.ended_at, subscription.auto_renew = "cancelled", as_of, False; result["cancelled"] += 1
-        elif subscription.auto_renew:
-            if subscription.pending_plan_price_id:
-                subscription.plan_id, subscription.plan_price_id = subscription.pending_plan_id or subscription.plan_id, subscription.pending_plan_price_id
-                subscription.pending_plan_id = subscription.pending_plan_price_id = None
-            price = services.one(db, models.PlanPrice, principal.organization_id, subscription.plan_price_id)
-            start, end = services.subscription_period(subscription.current_period_end or as_of, price)
-            subscription.current_period_start, subscription.current_period_end, subscription.next_billing_at = start, end, end
-            subscription.status = "pending_payment"
             if not payload.dry_run:
-                services.create_invoice_for_subscription(db, principal, subscription, as_of, request_id(request)); result["created_invoices"] += 1
-        subscription.version += 1
-        if not payload.dry_run:
+                subscription.status, subscription.ended_at, subscription.auto_renew, subscription.updated_by = "cancelled", as_of, False, principal.user_id
+            result["cancelled"] += 1
+            changed = True
+        elif not subscription.auto_renew:
+            if not payload.dry_run:
+                subscription.status, subscription.ended_at, subscription.next_billing_at, subscription.updated_by = "expired", as_of, None, principal.user_id
+            result["expired"] += 1
+            changed = True
+        else:
+            if subscription.pending_plan_price_id:
+                if not payload.dry_run:
+                    subscription.plan_id, subscription.plan_price_id = subscription.pending_plan_id or subscription.plan_id, subscription.pending_plan_price_id
+                    subscription.pending_plan_id = subscription.pending_plan_price_id = None
+            price = services.one(db, models.PlanPrice, principal.organization_id, subscription.pending_plan_price_id or subscription.plan_price_id)
+            start, end = services.subscription_period(subscription.current_period_end or as_of, price)
+            if not payload.dry_run:
+                subscription.current_period_start, subscription.current_period_end, subscription.next_billing_at = start, end, end
+                subscription.status, subscription.updated_by = "pending_payment", principal.user_id
+            if settings_row.auto_generate_invoices:
+                result["created_invoices"] += 1
+                if not payload.dry_run:
+                    services.create_invoice_for_subscription(db, principal, subscription, as_of, request_id(request))
+            changed = True
+        if changed and not payload.dry_run:
+            subscription.version += 1
             services.event(db, principal, subscription, "due_processed", previous, None, request_id(request))
-    for invoice in db.scalars(select(models.Invoice).where(models.Invoice.organization_id == principal.organization_id, models.Invoice.status == "open", models.Invoice.due_date < as_of.date())).all():
-        if not payload.dry_run:
-            invoice.status = "overdue"
-        result["marked_overdue"] += 1
     if payload.dry_run:
         db.rollback()
     else:

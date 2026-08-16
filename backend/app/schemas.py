@@ -134,6 +134,14 @@ class PaymentCreate(APIModel):
     allocations: list[AllocationInput] = Field(default_factory=list)
 
 
+class PaymentAllocationCommand(APIModel):
+    allocations: list[AllocationInput] = Field(min_length=1)
+
+
+class PaymentVoidCommand(APIModel):
+    reason: str | None = Field(default=None, max_length=2000)
+
+
 class PaymentAttemptCreate(APIModel):
     invoice_id: str
     provider: Literal["manual"] = "manual"
@@ -166,6 +174,7 @@ class SettingsUpdate(APIModel):
     allow_partial_payments: bool | None = None
     auto_renew_default: bool | None = None
     auto_generate_invoices: bool | None = None
+    enable_in_app_notifications: bool | None = None
     invoice_prefix: str | None = Field(default=None, pattern=r"^[A-Z]{2,8}$")
     payment_prefix: str | None = Field(default=None, pattern=r"^[A-Z]{2,8}$")
     subscription_prefix: str | None = Field(default=None, pattern=r"^[A-Z]{2,8}$")

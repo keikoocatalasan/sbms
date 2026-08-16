@@ -68,7 +68,7 @@ export function ConfirmDialog({ title, message, confirmLabel, danger = false, bu
 
 export type Column<T> = { key: string; label: string; render: (row: T) => React.ReactNode }
 
-export function DataTable<T>({ rows, columns, rowKey, searchPlaceholder, searchText, statusOf, statuses = [], planOf, planOptions = [], pageSize = 8, actions, onRowClick }: {
+export function DataTable<T>({ rows, columns, rowKey, searchPlaceholder, searchText, statusOf, statuses = [], planOf, planOptions = [], pageSize = 10, actions, onRowClick }: {
   rows: T[]
   columns: Column<T>[]
   rowKey: (row: T) => string
