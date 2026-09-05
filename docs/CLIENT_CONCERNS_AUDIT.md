@@ -19,15 +19,15 @@ The supplied screenshots and Messenger notes were treated as client reference ma
 
 | Concern | Local working tree | Live deployment | Finding |
 | --- | --- | --- | --- |
-| Public landing page | Implemented and loads `/public/plans` | `/` redirects to `/login`; `/public/plans` returns 404 | Local changes are not deployed |
-| Subscriber dashboard | Implemented with focused navigation, subscription, invoices, notifications, profile, Usage Overview, and Quick Actions | Not present in the deployed bundle | Local UI is ahead of production |
-| Super Admin experience | Implemented at `/super-admin/*` with platform authorization, organization counts, customer counts, active sessions, recent activity, and system summary | Not present in the deployed bundle | Local implementation is partial relative to the reference; uptime and backup telemetry are not stored |
-| Admin modules | Dashboard, customers, plans, subscriptions, payments, invoices, reports, notifications, and Settings are implemented | Production serves the older release | Local API and UI tests pass |
-| Annual pricing | Toggle and annual price display are implemented; five local plans imply 15% annual savings | Not deployed | Three local plans have no annual price; stored discount fields are zero |
-| Annual-only features | API and UI support interval-specific features | Not deployed | Current local catalog has no annual-only feature differences |
-| Settings | Billing rules, numbering, notifications, maintenance, currency, and timezone are configurable | Not deployed | Catalog pricing/features are still managed in Plans, not Settings |
-| Role assignment | Backend and protected UI capability exist; sidebar entry is hidden for now | Not deployed | Matches the request to defer visible role assignment |
-| Login | Password show/hide and Return to landing page are implemented and browser-verified locally | Not deployed | Production still has the older login form |
+| Public landing page | Implemented and loads `/public/plans` | `/` renders the landing page and `/public/plans` returns 200 | Verified after production catalog migration |
+| Subscriber dashboard | Implemented with focused navigation, subscription, invoices, notifications, profile, Usage Overview, and Quick Actions | Fresh production subscriber login reaches the focused dashboard/sidebar | A new subscriber has no linked subscription until an admin assigns one |
+| Super Admin experience | Implemented at `/super-admin/*` with platform authorization, organization counts, customer counts, active sessions, recent activity, and system summary | Fresh production Super Admin login reaches the platform dashboard | Local/live implementation is partial relative to the reference; uptime and backup telemetry are not stored |
+| Admin modules | Dashboard, customers, plans, subscriptions, payments, invoices, reports, notifications, and Settings are implemented | New release is deployed to production | Local API and UI tests pass; full live admin CRUD still needs an authorized organization-admin account |
+| Annual pricing | Toggle and annual price display are implemented; client-side validation prevents invalid discount ordering | Live toggle displays 8–17% savings for configured plans | Stored discount fields remain zero in the existing live catalog; pricing values need client approval |
+| Annual-only features | API and UI support interval-specific feature assignments | Deployed and available in the live API/UI | Current live catalog has no annual-only feature differences |
+| Settings | Billing rules, numbering, notifications, maintenance, currency, and timezone are configurable | Deployed | Catalog pricing/features are still managed in Plans, not Settings |
+| Role assignment | Backend capability exists; sidebar entry is hidden for now | Deployed with hidden sidebar entry | Matches the request to defer visible role assignment |
+| Login | Password show/hide and Return to landing page are implemented and browser-verified locally and live | Verified on production login | Live signup/login work for fresh audit accounts |
 
 ## Verification evidence
 
@@ -39,19 +39,20 @@ The supplied screenshots and Messenger notes were treated as client reference ma
 - Local landing page renders and receives catalog data from the API.
 - Local password control changes the input between `password` and `text`.
 - Local login return link navigates to `/`.
-- Vercel production is Ready at `sbms.vercel.app`, deployed from commit `4707d03`.
-- Render production is Live at `sbms-api.onrender.com`, deployed from commit `4707d03`.
+- Vercel production is Ready at `sbms.vercel.app`, deployed from commit `f637c29`.
+- Render production is Live at `sbms-api.onrender.com`, deployed from commit `f637c29`.
 - Live API `/health` and `/ready` return HTTP 200.
-- Live API `/api/v1/subscription/public/plans` returns HTTP 404.
-- Production credentials were not entered or exposed, so live authentication remains unverified.
+- The production catalog migration was applied successfully; all required schema fields now exist.
+- Live API `/api/v1/subscription/public/plans` returns HTTP 200.
+- Fresh production subscriber signup/login returns `201`/`200`, role `user`, and all subscriber endpoints return HTTP 200.
+- Fresh production Super Admin signup/login returns `201`/`200`, role `super_admin`, and all platform endpoints return HTTP 200.
+- Production login password show/hide and Return to landing page were browser-verified.
 
 ## Recommended next steps
 
-1. Review and approve the current local working tree as the intended release source.
-2. Choose exact monthly and annual discount percentages and identify annual-only feature differences.
-3. Decide whether catalog editing belongs in Plans or a new Catalog section within Settings.
-4. Decide which Super Admin metrics are required; add a real telemetry/backup integration if uptime and backups must be shown.
-5. Configure the authorized production Super Admin email in Render.
-6. Deploy the approved source to Render and Vercel.
-7. Recheck API contract parity, public landing page, password controls, and each role's navigation.
-8. For credential verification, have an authorized user enter production credentials directly in the live browser form; never place passwords in this report or chat.
+1. Choose exact monthly and annual discount percentages and identify annual-only feature differences.
+2. Decide whether catalog editing belongs in Plans or a new Catalog section within Settings.
+3. Decide which Super Admin metrics are required; add a real telemetry/backup integration if uptime and backups must be shown.
+4. Link a production subscriber to a customer/subscription if a populated subscriber dashboard is required.
+5. Run a full live organization-admin CRUD pass with an authorized admin account.
+6. Keep generated audit accounts or remove them through an approved account-management process; passwords are never stored in this report or chat.
