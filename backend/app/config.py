@@ -16,10 +16,15 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     organization_id: str = "00000000-0000-0000-0000-000000000001"
     organization_name: str = "Argo Subscription Management"
+    super_admin_emails: str = ""
 
     @property
     def origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def super_admin_email_set(self) -> set[str]:
+        return {email.strip().lower() for email in self.super_admin_emails.split(",") if email.strip()}
 
 
 @lru_cache

@@ -5,6 +5,23 @@ export type AuthUser = {
   name: string
   email: string
   scopes: string[]
+  role: 'super_admin' | 'org_admin' | 'user'
+}
+
+export type TeamUser = BaseRecord & {
+  organization_id: string
+  name: string
+  email: string
+  status: 'active' | 'suspended' | 'inactive'
+  role: 'org_admin' | 'user' | 'super_admin'
+}
+
+export type PlatformOrganization = BaseRecord & {
+  name: string
+  slug: string
+  status: string
+  administrators: number
+  users: number
 }
 
 export type BaseRecord = {
@@ -30,10 +47,15 @@ export type PlanPrice = BaseRecord & {
   billing_interval: 'month' | 'year'
   interval_count: number
   currency: string
+  list_amount_minor: number | null
   unit_amount_minor: number
   setup_fee_minor: number
+  discount_bps: number
   status: string
+  effective_from: string
+  effective_to: string | null
   is_default: boolean
+  features?: PlanFeature[]
 }
 
 export type Plan = BaseRecord & {
@@ -45,6 +67,28 @@ export type Plan = BaseRecord & {
   is_featured: boolean
   display_order: number
   prices: PlanPrice[]
+  features?: PlanFeature[]
+}
+
+export type Feature = BaseRecord & {
+  feature_code: string
+  name: string
+  description: string | null
+  value_type: 'boolean' | 'number' | 'text'
+  unit_label: string | null
+  status: string
+}
+
+export type PlanFeature = BaseRecord & {
+  plan_id: string
+  feature_id: string
+  billing_interval: 'month' | 'year' | null
+  is_included: boolean
+  value_boolean: boolean | null
+  value_number: number | null
+  value_text: string | null
+  display_order: number
+  feature?: Feature
 }
 
 export type Subscription = BaseRecord & {

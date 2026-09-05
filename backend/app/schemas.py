@@ -64,14 +64,59 @@ class PriceCreate(APIModel):
     billing_interval: Literal["month", "year"]
     interval_count: int = Field(default=1, ge=1, le=12)
     currency: str = Field(default="PHP", pattern=r"^[A-Z]{3}$")
+    list_amount_minor: int | None = Field(default=None, ge=0)
     unit_amount_minor: int = Field(ge=0)
     setup_fee_minor: int = Field(default=0, ge=0)
+    discount_bps: int = Field(default=0, ge=0, le=10000)
     effective_from: date = Field(default_factory=date.today)
     is_default: bool = True
 
 
+class PriceUpdate(APIModel):
+    list_amount_minor: int | None = Field(default=None, ge=0)
+    unit_amount_minor: int | None = Field(default=None, ge=0)
+    setup_fee_minor: int | None = Field(default=None, ge=0)
+    effective_from: date | None = None
+    is_default: bool | None = None
+    status: Literal["active", "inactive", "archived"] | None = None
+    discount_bps: int | None = Field(default=None, ge=0, le=10000)
+
+
 class PlanStatus(APIModel):
     status: Literal["draft", "active", "inactive", "archived"]
+
+
+class FeatureCreate(APIModel):
+    feature_code: str = Field(min_length=2, max_length=50, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    value_type: Literal["boolean", "number", "text"] = "boolean"
+    unit_label: str | None = Field(default=None, max_length=40)
+
+
+class FeatureUpdate(APIModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    unit_label: str | None = Field(default=None, max_length=40)
+    status: Literal["active", "inactive", "archived"] | None = None
+
+
+class UserRoleUpdate(APIModel):
+    role: Literal["org_admin", "user"]
+
+
+class UserStatusUpdate(APIModel):
+    status: Literal["active", "suspended", "inactive"]
+
+
+class PlanFeatureUpdate(APIModel):
+    feature_id: str
+    billing_interval: Literal["month", "year"] | None = None
+    is_included: bool = True
+    value_boolean: bool | None = None
+    value_number: int | None = Field(default=None, ge=0)
+    value_text: str | None = Field(default=None, max_length=255)
+    display_order: int = Field(default=0, ge=0)
 
 
 class SubscriptionCreate(APIModel):

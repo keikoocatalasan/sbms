@@ -38,6 +38,18 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class AuthSession(Base):
+    __tablename__ = "subscription_auth_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class TenantRecord:
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
@@ -94,7 +106,9 @@ class PlanPrice(TenantRecord, Base):
     billing_interval: Mapped[str] = mapped_column(String(10), nullable=False)
     interval_count: Mapped[int] = mapped_column(Integer, default=1)
     currency: Mapped[str] = mapped_column(String(3), default="PHP")
+    list_amount_minor: Mapped[int | None] = mapped_column(Integer)
     unit_amount_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    discount_bps: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     setup_fee_minor: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="active")
     effective_from: Mapped[date] = mapped_column(Date, default=date.today)
@@ -104,6 +118,7 @@ class PlanPrice(TenantRecord, Base):
 
 class Feature(TenantRecord, Base):
     __tablename__ = "subscription_features"
+    __table_args__ = (UniqueConstraint("organization_id", "feature_code"),)
     feature_code: Mapped[str] = mapped_column(String(50), nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
@@ -116,6 +131,7 @@ class PlanFeature(TenantRecord, Base):
     __tablename__ = "subscription_plan_features"
     plan_id: Mapped[str] = mapped_column(ForeignKey("subscription_plans.id"), nullable=False)
     feature_id: Mapped[str] = mapped_column(ForeignKey("subscription_features.id"), nullable=False)
+    billing_interval: Mapped[str | None] = mapped_column(String(10))
     is_included: Mapped[bool] = mapped_column(Boolean, default=True)
     value_boolean: Mapped[bool | None] = mapped_column(Boolean)
     value_number: Mapped[int | None] = mapped_column(Integer)

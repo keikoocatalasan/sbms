@@ -1,11 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { api, apiMessage } from './api'
-import type { AuthUser, Customer, DashboardSummary, Envelope, Invoice, MrrReport, Notification, Payment, Plan, Subscription, SystemSettings } from './types'
+import type { AuthUser, Customer, DashboardSummary, Envelope, Feature, Invoice, MrrReport, Notification, Payment, Plan, Subscription, SystemSettings } from './types'
 
 type AppDataValue = {
   user: AuthUser
   customers: Customer[]
   plans: Plan[]
+  features: Feature[]
   subscriptions: Subscription[]
   invoices: Invoice[]
   payments: Payment[]
@@ -37,6 +38,7 @@ async function fetchAll<T>(path: string, pageSize = 100) {
 export function AppDataProvider({ user, children }: { user: AuthUser; children: React.ReactNode }) {
   const [customers, setCustomers] = useState<Customer[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
+  const [features, setFeatures] = useState<Feature[]>([])
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
   const [invoices, setInvoices] = useState<Invoice[]>([])
   const [payments, setPayments] = useState<Payment[]>([])
@@ -61,6 +63,7 @@ export function AppDataProvider({ user, children }: { user: AuthUser; children: 
         fetchAll<Invoice>('/invoices'),
         fetchAll<Payment>('/payments'),
         fetchAll<Notification>('/notifications'),
+        fetchAll<Feature>('/features'),
         api.get<Envelope<SystemSettings>>('/settings'),
       ])
       setSummary(common[0].data.data)
@@ -70,7 +73,8 @@ export function AppDataProvider({ user, children }: { user: AuthUser; children: 
       setInvoices(common[4])
       setPayments(common[5])
       setNotifications(common[6])
-      setSettings(common[7].data.data)
+      setFeatures(common[7])
+      setSettings(common[8].data.data)
       if (can('subscription:reports')) {
         const report = await api.get<Envelope<MrrReport>>('/reports/mrr')
         setMrr(report.data.data)
@@ -86,7 +90,7 @@ export function AppDataProvider({ user, children }: { user: AuthUser; children: 
 
   useEffect(() => { void refresh() }, [refresh])
 
-  const value = useMemo(() => ({ user, customers, plans, subscriptions, invoices, payments, notifications, settings, summary, mrr, loading, error, refresh, can }), [user, customers, plans, subscriptions, invoices, payments, notifications, settings, summary, mrr, loading, error, refresh, can])
+  const value = useMemo(() => ({ user, customers, plans, features, subscriptions, invoices, payments, notifications, settings, summary, mrr, loading, error, refresh, can }), [user, customers, plans, features, subscriptions, invoices, payments, notifications, settings, summary, mrr, loading, error, refresh, can])
   return <AppDataContext.Provider value={value}>{children}</AppDataContext.Provider>
 }
 

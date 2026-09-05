@@ -1,9 +1,9 @@
 import { FormEvent, useEffect, useState } from 'react'
-import { AlertCircle, LoaderCircle } from 'lucide-react'
+import { AlertCircle, LoaderCircle, Pencil, Plus, Trash2 } from 'lucide-react'
 import { api, apiMessage, requestKey } from './api'
-import { downloadCsv, Modal, money, shortDate, Status } from './components'
+import { ConfirmDialog, downloadCsv, EmptyState, Modal, money, shortDate, Status } from './components'
 import { useAppData } from './app-data'
-import type { Customer, Envelope, Invoice, Payment, Plan, Subscription } from './types'
+import type { Customer, Envelope, Feature, Invoice, Payment, Plan, PlanPrice, Subscription } from './types'
 
 type DialogProps = { onClose: () => void; onDone: (message: string) => Promise<void> | void }
 
@@ -50,24 +50,40 @@ export function PlanDialog({ plan, onClose, onDone }: DialogProps & { plan?: Pla
     const form = new FormData(event.currentTarget)
     try {
       if (plan) {
-        await api.patch(`/plans/${plan.id}`, { name: form.get('name'), description: form.get('description') || null, trial_days: Number(form.get('trial_days')), is_featured: form.get('is_featured') === 'on' })
+        await api.patch(`/plans/${plan.id}`, { name: form.get('name'), description: form.get('description') || null, trial_days: Number(form.get('trial_days')), is_featured: form.get('is_featured') === 'on', display_order: Number(form.get('display_order')) })
       } else {
         const code = String(form.get('plan_code')).trim().toUpperCase().replace(/[^A-Z0-9_-]+/g, '-')
+        const currency = settings?.default_currency ?? 'PHP'
+        const monthlyList = Math.round(Number(form.get('monthly_amount')) * 100)
+        const monthlyDiscount = Math.round(Number(form.get('monthly_discount') || 0) * 100)
+        const annualInput = String(form.get('annual_amount') ?? '').trim()
+        const annualDiscount = Math.round(Number(form.get('annual_discount') || 0) * 100)
+        if (annualInput && annualDiscount <= monthlyDiscount) {
+          setError('Annual discount must be greater than the monthly discount.')
+          setBusy(false)
+          return
+        }
         const created = await api.post<Envelope<Plan>>('/plans', { plan_code: code, name: form.get('name'), description: form.get('description') || null, trial_days: Number(form.get('trial_days')), is_featured: form.get('is_featured') === 'on' })
-        await api.post(`/plans/${created.data.data.id}/prices`, { price_code: `${code}-${String(form.get('billing_interval')).toUpperCase()}`, billing_interval: form.get('billing_interval'), currency: settings?.default_currency ?? 'PHP', unit_amount_minor: Math.round(Number(form.get('amount')) * 100), setup_fee_minor: 0, is_default: true })
+        await api.post(`/plans/${created.data.data.id}/prices`, { price_code: `${code}-MONTH`, billing_interval: 'month', currency, list_amount_minor: monthlyList, unit_amount_minor: Math.round(monthlyList * (10000 - monthlyDiscount) / 10000), discount_bps: monthlyDiscount, setup_fee_minor: 0, is_default: true })
+        if (annualInput) {
+          const annualList = Math.round(Number(annualInput) * 100)
+          await api.post(`/plans/${created.data.data.id}/prices`, { price_code: `${code}-YEAR`, billing_interval: 'year', currency, list_amount_minor: annualList, unit_amount_minor: Math.round(annualList * (10000 - annualDiscount) / 10000), discount_bps: annualDiscount, setup_fee_minor: 0, is_default: true })
+        }
         await api.patch(`/plans/${created.data.data.id}/status`, { status: 'active' })
       }
       await onDone(plan ? 'Plan details updated. Existing subscription prices were preserved.' : 'Plan and active price created.'); onClose()
     } catch (caught) { setError(apiMessage(caught, 'Unable to save the plan.')) } finally { setBusy(false) }
   }
-  const price = plan?.prices.find(item => item.is_default) ?? plan?.prices[0]
   return <Modal title={plan ? `Edit ${plan.name}` : 'Create subscription plan'} description={plan ? 'Plan prices are immutable billing records. Create a new price when commercial terms change.' : 'Create the plan and its first active price together.'} onClose={onClose}>
     <form onSubmit={submit} className="form-grid">
       <label>Plan name<input name="name" required maxLength={120} defaultValue={plan?.name}/></label>
       {!plan && <label>Plan code<input name="plan_code" required pattern="[A-Za-z0-9_-]+" placeholder="PROFESSIONAL"/></label>}
-      {!plan && <label>Billing interval<select name="billing_interval" defaultValue="month"><option value="month">Monthly</option><option value="year">Annual</option></select></label>}
-      {!plan && <label>Price ({settings?.default_currency ?? 'PHP'})<input name="amount" required type="number" min="0" step="0.01" defaultValue={price ? price.unit_amount_minor / 100 : ''}/></label>}
+      {!plan && <label>Monthly list price ({settings?.default_currency ?? 'PHP'})<input name="monthly_amount" required type="number" min="0" step="0.01"/></label>}
+      {!plan && <label>Monthly discount (%)<input name="monthly_discount" type="number" min="0" max="100" step="0.01" defaultValue="0"/></label>}
+      {!plan && <label>Annual list price ({settings?.default_currency ?? 'PHP'})<input name="annual_amount" type="number" min="0" step="0.01"/></label>}
+      {!plan && <label>Annual discount (%)<input name="annual_discount" type="number" min="0" max="100" step="0.01" defaultValue="0"/></label>}
       <label>Trial days<input name="trial_days" type="number" min="0" max="365" defaultValue={plan?.trial_days ?? 7}/></label>
+      <label>Display order<input name="display_order" type="number" min="0" max="10000" defaultValue={plan?.display_order ?? 0}/></label>
       <label className="checkbox"><input name="is_featured" type="checkbox" defaultChecked={plan?.is_featured}/> Highlight this plan</label>
       <label className="span-2">Description and included features<textarea name="description" maxLength={2000} defaultValue={plan?.description ?? ''} placeholder="Describe the intended customer and included service."/></label>
       <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy}/></div>
@@ -75,7 +91,7 @@ export function PlanDialog({ plan, onClose, onDone }: DialogProps & { plan?: Pla
   </Modal>
 }
 
-export function PlanPriceDialog({ plan, onClose, onDone }: DialogProps & { plan: Plan }) {
+export function PlanPriceDialog({ plan, price, used = false, onClose, onDone }: DialogProps & { plan: Plan; price?: PlanPrice; used?: boolean }) {
   const { settings } = useAppData()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -83,21 +99,116 @@ export function PlanPriceDialog({ plan, onClose, onDone }: DialogProps & { plan:
     event.preventDefault(); setBusy(true); setError('')
     const form = new FormData(event.currentTarget)
     try {
-      await api.post(`/plans/${plan.id}/prices`, { price_code: String(form.get('price_code')).trim().toUpperCase(), billing_interval: form.get('billing_interval'), interval_count: Number(form.get('interval_count')), currency: form.get('currency'), unit_amount_minor: Math.round(Number(form.get('amount')) * 100), setup_fee_minor: 0, is_default: form.get('is_default') === 'on' })
-      await onDone('New plan price created. Existing subscription prices were preserved.'); onClose()
+      if (price) {
+        const payload: Record<string, unknown> = { is_default: form.get('is_default') === 'on', status: form.get('status') }
+        if (!used) {
+          const listAmountMinor = Math.round(Number(form.get('amount')) * 100)
+          const discountBps = Math.round(Number(form.get('discount') || 0) * 100)
+          payload.list_amount_minor = listAmountMinor
+          payload.unit_amount_minor = Math.round(listAmountMinor * (10000 - discountBps) / 10000)
+          payload.setup_fee_minor = Math.round(Number(form.get('setup_fee')) * 100)
+          payload.effective_from = form.get('effective_from')
+          payload.discount_bps = discountBps
+        }
+        await api.patch(`/plans/${plan.id}/prices/${price.id}`, payload)
+        await onDone('Plan price updated.');
+      } else {
+        const listAmountMinor = Math.round(Number(form.get('amount')) * 100)
+        const discountBps = Math.round(Number(form.get('discount') || 0) * 100)
+        await api.post(`/plans/${plan.id}/prices`, { price_code: String(form.get('price_code')).trim().toUpperCase(), billing_interval: form.get('billing_interval'), interval_count: Number(form.get('interval_count')), currency: form.get('currency'), list_amount_minor: listAmountMinor, unit_amount_minor: Math.round(listAmountMinor * (10000 - discountBps) / 10000), discount_bps: discountBps, setup_fee_minor: Math.round(Number(form.get('setup_fee')) * 100), effective_from: form.get('effective_from'), is_default: form.get('is_default') === 'on' })
+        await onDone('New plan price created. Existing subscription prices were preserved.');
+      }
+      onClose()
     } catch (caught) { setError(apiMessage(caught, 'Unable to create the plan price.')) } finally { setBusy(false) }
   }
-  return <Modal title={`Add price to ${plan.name}`} description="Prices are immutable billing records. New subscriptions will use the active default price." onClose={onClose}>
+  return <Modal title={price ? `Edit ${plan.name} price` : `Add price to ${plan.name}`} description={price ? used ? 'This price is used by existing subscriptions. Only its default and availability status can change.' : 'Amount, setup fee, effective date, default status, and availability can be edited until the price is used by a subscription.' : 'Price codes, intervals, and currencies identify a billing record. Create a new version when commercial terms change.'} onClose={onClose}>
     <form onSubmit={submit} className="form-grid">
-      <label>Price code<input name="price_code" required pattern="[A-Za-z0-9_-]+" defaultValue={`${plan.plan_code}-MONTH-${Date.now().toString().slice(-4)}`}/></label>
-      <label>Billing interval<select name="billing_interval" defaultValue="month"><option value="month">Monthly</option><option value="year">Annual</option></select></label>
-      <label>Interval count<input name="interval_count" type="number" min="1" max="12" defaultValue="1"/></label>
-      <label>Currency<select name="currency" defaultValue={settings?.default_currency ?? 'PHP'}><option value="PHP">PHP — Philippine Peso</option><option value="USD">USD — US Dollar</option></select></label>
-      <label>Price ({settings?.default_currency ?? 'PHP'})<input name="amount" required type="number" min="0" step="0.01"/></label>
-      <label className="checkbox"><input name="is_default" type="checkbox" defaultChecked/> Make default for this interval</label>
+      {!price && <label>Price code<input name="price_code" required pattern="[A-Za-z0-9_-]+" defaultValue={`${plan.plan_code}-MONTH-${Date.now().toString().slice(-4)}`}/></label>}
+      {price && <label>Price code<input value={price.price_code} readOnly/></label>}
+      <label>Billing interval<select name="billing_interval" defaultValue={price?.billing_interval ?? 'month'} disabled={Boolean(price)}><option value="month">Monthly</option><option value="year">Annual</option></select></label>
+      <label>Interval count<input name="interval_count" type="number" min="1" max="12" defaultValue={price?.interval_count ?? 1} readOnly={Boolean(price)}/></label>
+      <label>Currency<select name="currency" defaultValue={price?.currency ?? settings?.default_currency ?? 'PHP'} disabled={Boolean(price)}><option value="PHP">PHP - Philippine Peso</option><option value="USD">USD - US Dollar</option></select></label>
+      <label>List price ({price?.currency ?? settings?.default_currency ?? 'PHP'})<input name="amount" required type="number" min="0" step="0.01" defaultValue={price ? (price.list_amount_minor ?? price.unit_amount_minor) / 100 : ''} disabled={used}/></label>
+      <label>Discount (%)<input name="discount" required type="number" min="0" max="100" step="0.01" defaultValue={price ? price.discount_bps / 100 : 0} disabled={used}/></label>
+      <label>Setup fee ({price?.currency ?? settings?.default_currency ?? 'PHP'})<input name="setup_fee" required type="number" min="0" step="0.01" defaultValue={price ? price.setup_fee_minor / 100 : 0} disabled={used}/></label>
+      <label>Effective from<input name="effective_from" type="date" required defaultValue={price?.effective_from ?? new Date().toISOString().slice(0, 10)} disabled={used}/></label>
+      <label>Status<select name="status" defaultValue={price?.status ?? 'active'}><option value="active">Active</option><option value="inactive">Inactive</option><option value="archived">Archived</option></select></label>
+      <label className="checkbox"><input name="is_default" type="checkbox" defaultChecked={price?.is_default ?? true}/> Make default for this interval</label>
       <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Create price"/></div>
     </form>
   </Modal>
+}
+
+export function FeatureDialog({ feature, onClose, onDone }: DialogProps & { feature?: Feature }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    const form = new FormData(event.currentTarget)
+    try {
+      const values = { name: form.get('name'), description: form.get('description') || null, unit_label: form.get('unit_label') || null }
+      if (feature) await api.patch(`/features/${feature.id}`, { ...values, status: form.get('status') })
+      else await api.post('/features', { feature_code: String(form.get('feature_code')).trim().toUpperCase(), ...values, value_type: form.get('value_type') })
+      await onDone(feature ? 'Feature updated.' : 'Feature created.'); onClose()
+    } catch (caught) { setError(apiMessage(caught, 'Unable to save the feature.')) } finally { setBusy(false) }
+  }
+  return <Modal title={feature ? `Edit ${feature.name}` : 'Create feature'} description={feature ? 'Feature names, descriptions, units, and availability can be updated. The value type is immutable after creation.' : 'Create a reusable capability that can be assigned to any subscription plan.'} onClose={onClose}>
+    <form onSubmit={submit} className="form-grid">
+      {!feature && <label>Feature code<input name="feature_code" required pattern="[A-Za-z0-9_-]+" placeholder="PRIORITY_SUPPORT"/></label>}
+      {feature && <label>Feature code<input value={feature.feature_code} readOnly/></label>}
+      <label>Feature name<input name="name" required maxLength={120} defaultValue={feature?.name}/></label>
+      {!feature && <label>Value type<select name="value_type" defaultValue="boolean"><option value="boolean">Included / not included</option><option value="number">Numeric limit</option><option value="text">Text value</option></select></label>}
+      {feature && <label>Value type<input value={feature.value_type} readOnly/></label>}
+      <label>Unit label<input name="unit_label" maxLength={40} defaultValue={feature?.unit_label ?? ''} placeholder="users, GB, calls"/></label>
+      {feature && <label>Status<select name="status" defaultValue={feature.status}><option value="active">Active</option><option value="inactive">Inactive</option><option value="archived">Archived</option></select></label>}
+      <label className="span-2">Description<textarea name="description" maxLength={2000} defaultValue={feature?.description ?? ''}/></label>
+      <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy}/></div>
+    </form>
+  </Modal>
+}
+
+export function PlanFeaturesDialog({ plan, onClose, onDone }: DialogProps & { plan: Plan }) {
+  const { features } = useAppData()
+  const existing = plan.features ?? []
+  const [selected, setSelected] = useState<Record<string, boolean>>(() => Object.fromEntries(existing.map(item => [item.feature_id, item.is_included])))
+  const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(existing.map(item => [item.feature_id, item.value_number != null ? String(item.value_number) : item.value_text ?? ''])))
+  const [intervals, setIntervals] = useState<Record<string, string>>(() => Object.fromEntries(existing.map(item => [item.feature_id, item.billing_interval ?? ''])))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    try {
+      for (const [index, feature] of features.entries()) {
+        if (selected[feature.id]) {
+          const raw = values[feature.id] ?? ''
+          await api.put(`/plans/${plan.id}/features`, { feature_id: feature.id, billing_interval: intervals[feature.id] || null, is_included: true, value_boolean: feature.value_type === 'boolean' ? true : null, value_number: feature.value_type === 'number' && raw !== '' ? Number(raw) : null, value_text: feature.value_type === 'text' ? raw || null : null, display_order: index })
+        }
+      }
+      for (const item of existing) if (!selected[item.feature_id]) await api.delete(`/plans/${plan.id}/features/${item.feature_id}`)
+      await onDone('Plan features updated.'); onClose()
+    } catch (caught) { setError(apiMessage(caught, 'Unable to update plan features.')) } finally { setBusy(false) }
+  }
+  return <Modal wide title={`Features for ${plan.name}`} description="Choose the capabilities included in this plan. Values are stored with the plan and shown to subscribers." onClose={onClose}>
+    <form onSubmit={submit} className="feature-form">
+      {features.length ? <div className="feature-list">{features.map(feature => <div className="feature-edit-row" key={feature.id}><label className="checkbox"><input type="checkbox" checked={Boolean(selected[feature.id])} onChange={event => setSelected(current => ({ ...current, [feature.id]: event.target.checked }))}/><span><b>{feature.name}</b><small>{feature.description || feature.feature_code}</small></span></label><select value={intervals[feature.id] ?? ''} disabled={!selected[feature.id]} onChange={event => setIntervals(current => ({ ...current, [feature.id]: event.target.value }))} aria-label={`Billing cycle for ${feature.name}`}><option value="">All cycles</option><option value="month">Monthly only</option><option value="year">Annual only</option></select>{feature.value_type === 'number' && <input type="number" min="0" value={values[feature.id] ?? ''} disabled={!selected[feature.id]} onChange={event => setValues(current => ({ ...current, [feature.id]: event.target.value }))} placeholder={feature.unit_label ?? 'Limit'}/>} {feature.value_type === 'text' && <input value={values[feature.id] ?? ''} disabled={!selected[feature.id]} onChange={event => setValues(current => ({ ...current, [feature.id]: event.target.value }))} placeholder={feature.unit_label ?? 'Value'}/>}</div>)}</div> : <p className="empty-state">No features exist yet. Create them from the feature catalog.</p>}
+      <FormError message={error}/><div className="modal-actions"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Save features"/></div>
+    </form>
+  </Modal>
+}
+
+export function FeatureCatalogDialog({ onClose, onDone }: DialogProps) {
+  const { features } = useAppData()
+  const [editor, setEditor] = useState<'new' | Feature | null>(null)
+  const [removeTarget, setRemoveTarget] = useState<Feature | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  async function remove() {
+    if (!removeTarget) return
+    setBusy(true); setError('')
+    try { await api.delete(`/features/${removeTarget.id}`); await onDone('Feature removed.'); setRemoveTarget(null) } catch (caught) { setError(apiMessage(caught, 'Unable to remove the feature.')) } finally { setBusy(false) }
+  }
+  return <Modal wide title="Feature catalog" description="Create and maintain reusable plan capabilities. Removing a linked feature archives it to preserve plan history." onClose={onClose}>
+    <div className="feature-catalog"><button type="button" className="button primary" onClick={() => setEditor('new')}><Plus size={16}/>Add feature</button>{features.map(feature => <div className="feature-catalog-row" key={feature.id}><div><b>{feature.name}</b><small>{feature.feature_code} · {feature.value_type}{feature.unit_label ? ` · ${feature.unit_label}` : ''}</small></div><div><button type="button" className="icon-button" aria-label={`Edit ${feature.name}`} onClick={() => setEditor(feature)}><Pencil size={15}/></button><button type="button" className="icon-button danger-text" aria-label={`Remove ${feature.name}`} onClick={() => setRemoveTarget(feature)}><Trash2 size={15}/></button></div></div>)}{!features.length && <EmptyState title="No features" copy="Create the first feature to assign capabilities to a plan."/>}{error && <FormError message={error}/>}</div>{editor && <FeatureDialog feature={editor === 'new' ? undefined : editor} onClose={() => setEditor(null)} onDone={onDone}/>} {removeTarget && <ConfirmDialog title="Remove feature" message={`Remove ${removeTarget.name}? Linked plan features will be archived instead of deleted.`} confirmLabel="Remove feature" danger busy={busy} onCancel={() => setRemoveTarget(null)} onConfirm={() => void remove()}/>}</Modal>
 }
 
 export function SubscriptionDialog({ onClose, onDone }: DialogProps) {
@@ -231,7 +342,7 @@ export function NotificationDialog({ onClose, onDone }: DialogProps) {
   </Modal>
 }
 
-export function SubscriptionCommandDialog({ subscription, mode, onClose, onDone }: DialogProps & { subscription: Subscription; mode: 'change-plan' | 'schedule-cancel' | 'cancel-now' }) {
+export function SubscriptionCommandDialog({ subscription, mode, selfService = false, onClose, onDone }: DialogProps & { subscription: Subscription; mode: 'change-plan' | 'schedule-cancel' | 'cancel-now'; selfService?: boolean }) {
   const { plans } = useAppData()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -241,8 +352,9 @@ export function SubscriptionCommandDialog({ subscription, mode, onClose, onDone 
     event.preventDefault(); setBusy(true); setError('')
     const form = new FormData(event.currentTarget)
     try {
-      if (mode === 'change-plan') await api.post(`/subscriptions/${subscription.id}/schedule-plan-change`, { expected_version: subscription.version, target_plan_price_id: form.get('target_price_id'), reason: form.get('reason') || null })
-      else await api.post(`/subscriptions/${subscription.id}/${mode === 'cancel-now' ? 'cancel-now' : 'schedule-cancellation'}`, { expected_version: subscription.version, reason: form.get('reason') || null })
+      const prefix = selfService ? `/me/subscriptions/${subscription.id}` : `/subscriptions/${subscription.id}`
+      if (mode === 'change-plan') await api.post(`${prefix}/schedule-plan-change`, { expected_version: subscription.version, target_plan_price_id: form.get('target_price_id'), reason: form.get('reason') || null })
+      else await api.post(`${prefix}/${mode === 'cancel-now' ? 'cancel-now' : 'schedule-cancellation'}`, { expected_version: subscription.version, reason: form.get('reason') || null })
       await onDone(mode === 'change-plan' ? 'Plan change scheduled for the end of the current period.' : mode === 'cancel-now' ? 'Subscription cancelled immediately.' : 'Cancellation scheduled for the end of the current period.'); onClose()
     } catch (caught) { setError(apiMessage(caught, 'Unable to update the subscription.')) } finally { setBusy(false) }
   }

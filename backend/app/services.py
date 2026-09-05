@@ -34,10 +34,59 @@ def one(session: Session, model: type[T], organization_id: str, record_id: str) 
     return record
 
 
-def list_page(session: Session, model: type[T], organization_id: str, page: int, page_size: int, q: str | None = None, text_column: Any | None = None) -> tuple[list[T], int]:
+BACKOFFICE_SCOPES = frozenset({"subscription:admin", "subscription:billing", "subscription:support", "subscription:reports", "subscription:system"})
+NO_CUSTOMER_MATCH = "__no_customer_match__"
+
+
+def is_restricted_principal(principal: Principal) -> bool:
+    return not principal.scopes.intersection(BACKOFFICE_SCOPES)
+
+
+def self_customer_id(session: Session, principal: Principal) -> str | None:
+    """Return the sole customer visible to a subscriber user.
+
+    The current schema predates an explicit user/customer link, so email is
+    used as a compatibility bridge until the membership migration adds that
+    relationship. A sentinel prevents an unlinked user from seeing everyone.
+    """
+    if not is_restricted_principal(principal):
+        return None
+    user = session.get(models.User, principal.user_id)
+    if not user:
+        return NO_CUSTOMER_MATCH
+    customer_id = session.scalar(
+        select(models.Customer.id).where(
+            models.Customer.organization_id == principal.organization_id,
+            func.lower(models.Customer.email) == user.email.lower(),
+        )
+    )
+    return customer_id or NO_CUSTOMER_MATCH
+
+
+def plan_feature_public(session: Session, plan_id: str, organization_id: str, active_only: bool = False, billing_interval: str | None = None) -> list[dict[str, Any]]:
+    filters = [models.PlanFeature.plan_id == plan_id, models.PlanFeature.organization_id == organization_id]
+    if billing_interval:
+        filters.append((models.PlanFeature.billing_interval.is_(None)) | (models.PlanFeature.billing_interval == billing_interval))
+    if active_only:
+        filters.append(models.PlanFeature.is_included.is_(True))
+    feature_rows = session.scalars(select(models.PlanFeature).where(*filters).order_by(models.PlanFeature.display_order, models.PlanFeature.created_at)).all()
+    result = []
+    for row in feature_rows:
+        feature = session.scalar(select(models.Feature).where(models.Feature.id == row.feature_id, models.Feature.organization_id == organization_id))
+        if not feature or (active_only and feature.status != "active"):
+            continue
+        payload = public(row)
+        payload["feature"] = public(feature)
+        result.append(payload)
+    return result
+
+
+def list_page(session: Session, model: type[T], organization_id: str, page: int, page_size: int, q: str | None = None, text_column: Any | None = None, customer_id: str | None = None) -> tuple[list[T], int]:
     filters = [model.organization_id == organization_id]
     if q and text_column is not None:
         filters.append(text_column.ilike(f"%{q.strip()}%"))
+    if customer_id is not None:
+        filters.append(getattr(model, "customer_id", model.id) == customer_id)
     total = session.scalar(select(func.count()).select_from(model).where(*filters)) or 0
     rows = session.scalars(select(model).where(*filters).order_by(model.created_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
     return list(rows), total
@@ -87,6 +136,88 @@ def payment_public(session: Session, payment: models.Payment) -> dict[str, Any]:
     payload["allocated_minor"] = payment_allocated_amount(session, payment)
     payload["unallocated_minor"] = max(0, payment.amount_minor - payload["allocated_minor"])
     return payload
+
+
+def payment_public_many(session: Session, payments: list[models.Payment]) -> list[dict[str, Any]]:
+    """Serialize a payment page with one allocation aggregate query.
+
+    Payment pages are fetched in batches by the frontend. Calling
+    ``payment_public`` for every row performs one allocation query per payment,
+    which becomes a visible N+1 latency problem once the ledger contains a
+    realistic history. Keep the single-payment helper for mutation responses,
+    and use this batched path for collection endpoints.
+    """
+    if not payments:
+        return []
+    payment_ids = [payment.id for payment in payments]
+    organization_id = payments[0].organization_id
+    allocated_rows = session.execute(
+        select(
+            models.PaymentAllocation.payment_id,
+            func.coalesce(func.sum(models.PaymentAllocation.amount_minor), 0),
+        )
+        .where(
+            models.PaymentAllocation.payment_id.in_(payment_ids),
+            models.PaymentAllocation.organization_id == organization_id,
+        )
+        .group_by(models.PaymentAllocation.payment_id)
+    ).all()
+    allocated_by_payment = {payment_id: int(amount or 0) for payment_id, amount in allocated_rows}
+    result: list[dict[str, Any]] = []
+    for payment in payments:
+        payload = public(payment)
+        allocated = allocated_by_payment.get(payment.id, 0)
+        payload["allocated_minor"] = allocated
+        payload["unallocated_minor"] = max(0, payment.amount_minor - allocated)
+        result.append(payload)
+    return result
+
+
+def invoice_public_many(session: Session, invoices: list[models.Invoice]) -> list[dict[str, Any]]:
+    """Serialize an invoice page with batched item and allocation totals."""
+    if not invoices:
+        return []
+    invoice_ids = [invoice.id for invoice in invoices]
+    organization_id = invoices[0].organization_id
+    item_rows = session.execute(
+        select(
+            models.InvoiceItem.invoice_id,
+            func.coalesce(func.sum(models.InvoiceItem.quantity * models.InvoiceItem.unit_amount_minor), 0),
+        )
+        .where(
+            models.InvoiceItem.invoice_id.in_(invoice_ids),
+            models.InvoiceItem.organization_id == organization_id,
+        )
+        .group_by(models.InvoiceItem.invoice_id)
+    ).all()
+    paid_rows = session.execute(
+        select(
+            models.PaymentAllocation.invoice_id,
+            func.coalesce(func.sum(models.PaymentAllocation.amount_minor), 0),
+        )
+        .join(models.Payment, models.Payment.id == models.PaymentAllocation.payment_id)
+        .where(
+            models.PaymentAllocation.invoice_id.in_(invoice_ids),
+            models.PaymentAllocation.organization_id == organization_id,
+            models.Payment.organization_id == organization_id,
+            models.Payment.status == "completed",
+        )
+        .group_by(models.PaymentAllocation.invoice_id)
+    ).all()
+    item_totals = {invoice_id: int(amount or 0) for invoice_id, amount in item_rows}
+    paid_totals = {invoice_id: int(amount or 0) for invoice_id, amount in paid_rows}
+    today = date.today()
+    result: list[dict[str, Any]] = []
+    for invoice in invoices:
+        total = item_totals.get(invoice.id, 0)
+        paid = paid_totals.get(invoice.id, 0)
+        balance = 0 if invoice.status == "void" else max(0, total - paid)
+        payload = public(invoice)
+        payload["amounts"] = {"total_minor": total, "paid_minor": paid, "balance_minor": balance}
+        if invoice.status not in {"draft", "void"}:
+            payload["status"] = "paid" if balance <= 0 else "overdue" if invoice.due_date < today else "open"
+        result.append(payload)
+    return result
 
 
 def sync_invoice(session: Session, invoice: models.Invoice) -> None:

@@ -39,7 +39,11 @@ export function clearSession() {
 export function readUser(): AuthUser | null {
   try {
     const value = localStorage.getItem(userKey)
-    return value ? JSON.parse(value) as AuthUser : null
+    if (!value) return null
+    const parsed = JSON.parse(value) as Partial<AuthUser> & Pick<AuthUser, 'id' | 'name' | 'email' | 'scopes'>
+    const scopes = Array.isArray(parsed.scopes) ? parsed.scopes : []
+    const role = parsed.role ?? (scopes.includes('subscription:admin') ? 'org_admin' : 'user')
+    return { ...parsed, scopes, role }
   } catch {
     clearSession()
     return null
@@ -58,4 +62,3 @@ export function apiMessage(error: unknown, fallback = 'The request could not be 
   }
   return fallback
 }
-

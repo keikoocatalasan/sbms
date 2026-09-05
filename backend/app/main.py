@@ -7,12 +7,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 
 from . import models, schemas, services
 from .config import get_settings
 from .db import Base, engine, secure_postgres_tables
-from .security import ADMIN_SCOPES, DBSession, MEMBER_SCOPES, Principal, current_principal, hash_password, issue_token, request_id, require_scope, verify_password
+from .security import ADMIN_SCOPES, DBSession, MEMBER_SCOPES, Principal, SUPER_ADMIN_SCOPE, current_principal, effective_scopes, hash_password, issue_token, request_id, require_scope, role_for_user, verify_password
 
 
 settings = get_settings()
@@ -60,6 +61,8 @@ ReadPrincipal = Annotated[Principal, Depends(require_scope("subscription:read", 
 BillingPrincipal = Annotated[Principal, Depends(require_scope("subscription:billing", "subscription:admin"))]
 AdminPrincipal = Annotated[Principal, Depends(require_scope("subscription:admin"))]
 ReportsPrincipal = Annotated[Principal, Depends(require_scope("subscription:reports", "subscription:admin"))]
+AuthenticatedPrincipal = Annotated[Principal, Depends(current_principal)]
+PlatformPrincipal = Annotated[Principal, Depends(require_scope(SUPER_ADMIN_SCOPE))]
 
 
 @app.get("/health", tags=["Infrastructure"])
@@ -73,8 +76,155 @@ def ready(request: Request, db: DBSession) -> dict[str, Any]:
     return ok({"status": "ready", "database": "available"}, request)
 
 
-def auth_payload(user: models.User) -> dict[str, Any]:
-    return {"access_token": issue_token(user), "token_type": "bearer", "user": {"id": user.id, "name": user.name, "email": user.email, "scopes": user.scopes}}
+@app.get("/api/v1/subscription/public/plans", tags=["Plans"])
+def public_plans(request: Request, db: DBSession) -> dict[str, Any]:
+    """Return the published catalog used by the public landing page."""
+    rows = db.scalars(
+        select(models.Plan).where(
+            models.Plan.organization_id == settings.organization_id,
+            models.Plan.status == "active",
+        ).order_by(models.Plan.display_order, models.Plan.created_at)
+    ).all()
+    result = []
+    for plan in rows:
+        payload = {field: getattr(plan, field) for field in ("plan_code", "name", "description", "status", "trial_days", "is_featured", "display_order")}
+        payload["prices"] = []
+        for price in db.scalars(
+                select(models.PlanPrice).where(
+                    models.PlanPrice.organization_id == settings.organization_id,
+                    models.PlanPrice.plan_id == plan.id,
+                    models.PlanPrice.status == "active",
+                ).order_by(models.PlanPrice.billing_interval, models.PlanPrice.effective_from.desc())
+            ).all():
+            price_payload = {field: getattr(price, field) for field in ("price_code", "billing_interval", "interval_count", "currency", "list_amount_minor", "unit_amount_minor", "discount_bps", "setup_fee_minor", "status", "effective_from", "effective_to", "is_default")}
+            price_payload["features"] = [
+                {field: item.get(field) for field in ("billing_interval", "is_included", "value_boolean", "value_number", "value_text", "display_order")} | {"feature": {field: item["feature"].get(field) for field in ("feature_code", "name", "description", "value_type", "unit_label")}}
+                for item in services.plan_feature_public(db, plan.id, settings.organization_id, active_only=True, billing_interval=price.billing_interval)
+            ]
+            payload["prices"].append(price_payload)
+        payload["features"] = [
+            {field: item.get(field) for field in ("billing_interval", "is_included", "value_boolean", "value_number", "value_text", "display_order")} | {"feature": {field: item["feature"].get(field) for field in ("feature_code", "name", "description", "value_type", "unit_label")}}
+            for item in services.plan_feature_public(db, plan.id, settings.organization_id, active_only=True)
+        ]
+        result.append(payload)
+    return ok(result, request)
+
+
+def auth_payload(db: DBSession, user: models.User) -> dict[str, Any]:
+    scopes = effective_scopes(user)
+    session_id = str(uuid.uuid4())
+    now = services.now()
+    db.add(models.AuthSession(id=session_id, user_id=user.id, organization_id=user.organization_id, expires_at=now + timedelta(minutes=settings.jwt_expiry_minutes), created_at=now, last_seen_at=now))
+    db.flush()
+    return {"access_token": issue_token(user, scopes, session_id), "token_type": "bearer", "user": {"id": user.id, "name": user.name, "email": user.email, "scopes": sorted(scopes), "role": role_for_user(user)}}
+
+
+@app.post("/api/v1/subscription/auth/logout", tags=["Authentication"])
+def logout(request: Request, db: DBSession, principal: AuthenticatedPrincipal) -> dict[str, Any]:
+    """Revoke the current server-tracked session."""
+    if principal.session_id:
+        auth_session = db.get(models.AuthSession, principal.session_id)
+        if auth_session:
+            auth_session.revoked_at = services.now()
+            db.commit()
+    return ok({"signed_out": True, "user_id": principal.user_id}, request)
+
+
+@app.get("/api/v1/subscription/platform/summary", tags=["Platform"])
+def platform_summary(request: Request, db: DBSession, principal: PlatformPrincipal) -> dict[str, Any]:
+    organizations = db.scalar(select(func.count()).select_from(models.Organization)) or 0
+    active_organizations = db.scalar(select(func.count()).select_from(models.Organization).where(models.Organization.status == "active")) or 0
+    total_customers = db.scalar(select(func.count()).select_from(models.Customer)) or 0
+    users = db.scalars(select(models.User)).all()
+    admins = sum(1 for user in users if "subscription:admin" in effective_scopes(user))
+    subscribers = sum(1 for user in users if "subscription:admin" not in effective_scopes(user))
+    unread = db.scalar(select(func.count()).select_from(models.Notification).where(models.Notification.read_at.is_(None))) or 0
+    active_sessions = db.scalar(select(func.count()).select_from(models.AuthSession).where(models.AuthSession.revoked_at.is_(None), models.AuthSession.expires_at > datetime.now(timezone.utc))) or 0
+    activity_rows = db.scalars(select(models.ActivityLog).order_by(models.ActivityLog.created_at.desc()).limit(5)).all()
+    actor_ids = {row.actor_user_id for row in activity_rows if row.actor_user_id}
+    actors = {user.id: user.name for user in db.scalars(select(models.User).where(models.User.id.in_(actor_ids))).all()} if actor_ids else {}
+    recent_activity = [{"entity_type": row.entity_type, "action": row.action, "actor": actors.get(row.actor_user_id, "System"), "created_at": row.created_at.isoformat()} for row in activity_rows]
+    return ok({"organizations": organizations, "active_organizations": active_organizations, "total_customers": total_customers, "administrators": admins, "users": subscribers, "unread_notifications": unread, "active_sessions": active_sessions, "recent_activity": recent_activity}, request)
+
+
+@app.get("/api/v1/subscription/platform/organizations", tags=["Platform"])
+def platform_organizations(request: Request, db: DBSession, principal: PlatformPrincipal, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    page_size = min(page_size, 100)
+    organizations = db.scalars(select(models.Organization).order_by(models.Organization.created_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
+    total = db.scalar(select(func.count()).select_from(models.Organization)) or 0
+    users = db.scalars(select(models.User)).all()
+    result = []
+    for organization in organizations:
+        org_users = [user for user in users if user.organization_id == organization.id]
+        result.append({"id": organization.id, "name": organization.name, "slug": organization.slug, "status": organization.status, "administrators": sum("subscription:admin" in (user.scopes or []) for user in org_users), "users": sum("subscription:admin" not in (user.scopes or []) for user in org_users), "created_at": organization.created_at.isoformat(), "updated_at": organization.updated_at.isoformat()})
+    return ok(result, request, {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size})
+
+
+@app.get("/api/v1/subscription/platform/reports", tags=["Platform"])
+def platform_reports(request: Request, db: DBSession, principal: PlatformPrincipal) -> dict[str, Any]:
+    organizations = db.scalar(select(func.count()).select_from(models.Organization)) or 0
+    active_organizations = db.scalar(select(func.count()).select_from(models.Organization).where(models.Organization.status == "active")) or 0
+    subscriptions = db.scalars(select(models.Subscription)).all()
+    invoices = db.scalars(select(models.Invoice).where(models.Invoice.status != "void")).all()
+    return ok({"organizations": organizations, "active_organizations": active_organizations, "subscriptions": len(subscriptions), "active_subscriptions": sum(item.status == "active" for item in subscriptions), "trialing_subscriptions": sum(item.status == "trialing" for item in subscriptions), "outstanding_minor": sum(services.invoice_amounts(db, invoice)["balance_minor"] for invoice in invoices)}, request)
+
+
+def user_public(user: models.User) -> dict[str, Any]:
+    return {"id": user.id, "organization_id": user.organization_id, "name": user.name, "email": user.email, "status": user.status, "role": role_for_user(user), "created_at": user.created_at.isoformat(), "updated_at": user.updated_at.isoformat()}
+
+
+def active_org_admin_count(db: DBSession, organization_id: str) -> int:
+    users = db.scalars(select(models.User).where(models.User.organization_id == organization_id, models.User.status == "active")).all()
+    return sum("subscription:admin" in (user.scopes or []) for user in users)
+
+
+@app.get("/api/v1/subscription/users", tags=["Users"])
+def users(request: Request, db: DBSession, principal: AdminPrincipal, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    page_size = min(page_size, 100)
+    filters = [models.User.organization_id == principal.organization_id]
+    total = db.scalar(select(func.count()).select_from(models.User).where(*filters)) or 0
+    rows = db.scalars(select(models.User).where(*filters).order_by(models.User.created_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
+    return ok([user_public(user) for user in rows], request, {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size})
+
+
+@app.patch("/api/v1/subscription/users/{user_id}/role", tags=["Users"])
+def update_user_role(user_id: str, payload: schemas.UserRoleUpdate, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    if user_id == principal.user_id:
+        raise HTTPException(409, "You cannot change your own organization role")
+    user = db.scalar(select(models.User).where(models.User.id == user_id, models.User.organization_id == principal.organization_id))
+    if not user:
+        raise HTTPException(404, "User not found")
+    if user.email.lower() in settings.super_admin_email_set:
+        raise HTTPException(403, "Platform Super Admin access is managed outside the organization")
+    if payload.role == "org_admin":
+        user.scopes = ADMIN_SCOPES.copy()
+    else:
+        admins = active_org_admin_count(db, principal.organization_id)
+        if "subscription:admin" in (user.scopes or []) and admins <= 1:
+            raise HTTPException(409, "The organization must keep at least one active administrator")
+        user.scopes = MEMBER_SCOPES.copy()
+    user.updated_at = services.now()
+    services.activity(db, principal, "user", user.id, "role_updated", request_id(request), {"role": payload.role})
+    db.commit()
+    return ok(user_public(user), request)
+
+
+@app.patch("/api/v1/subscription/users/{user_id}/status", tags=["Users"])
+def update_user_status(user_id: str, payload: schemas.UserStatusUpdate, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    if user_id == principal.user_id:
+        raise HTTPException(409, "You cannot change your own account status")
+    user = db.scalar(select(models.User).where(models.User.id == user_id, models.User.organization_id == principal.organization_id))
+    if not user:
+        raise HTTPException(404, "User not found")
+    if payload.status != "active" and "subscription:admin" in (user.scopes or []):
+        admins = active_org_admin_count(db, principal.organization_id)
+        if admins <= 1:
+            raise HTTPException(409, "The organization must keep at least one active administrator")
+    user.status = payload.status
+    user.updated_at = services.now()
+    services.activity(db, principal, "user", user.id, "status_updated", request_id(request), {"status": payload.status})
+    db.commit()
+    return ok(user_public(user), request)
 
 
 @app.post("/api/v1/subscription/auth/signup", status_code=201, tags=["Authentication"])
@@ -94,7 +244,9 @@ def signup(payload: schemas.SignupRequest, request: Request, db: DBSession) -> d
     principal = Principal(user_id=user.id, organization_id=user.organization_id, scopes=set(user.scopes), name=user.name)
     services.settings_for(db, principal)
     db.commit()
-    return ok(auth_payload(user), request)
+    result = auth_payload(db, user)
+    db.commit()
+    return ok(result, request)
 
 
 @app.post("/api/v1/subscription/auth/login", tags=["Authentication"])
@@ -103,26 +255,34 @@ def login(payload: schemas.LoginRequest, request: Request, db: DBSession) -> dic
     user = db.scalar(select(models.User).where(func.lower(models.User.email) == email, models.User.status == "active"))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
-    return ok(auth_payload(user), request)
+    result = auth_payload(db, user)
+    db.commit()
+    return ok(result, request)
 
 
 @app.get("/api/v1/subscription/dashboard/summary", tags=["Dashboard"])
 def dashboard(request: Request, db: DBSession, principal: ReadPrincipal) -> dict[str, Any]:
     org = principal.organization_id
-    customers = db.scalar(select(func.count()).select_from(models.Customer).where(models.Customer.organization_id == org, models.Customer.status == "active")) or 0
-    subscriptions = db.scalar(select(func.count()).select_from(models.Subscription).where(models.Subscription.organization_id == org, models.Subscription.status == "active")) or 0
-    overdue = db.scalar(select(func.count()).select_from(models.Invoice).where(models.Invoice.organization_id == org, models.Invoice.status == "overdue")) or 0
-    invoices = db.scalars(select(models.Invoice).where(models.Invoice.organization_id == org, models.Invoice.status != "void")).all()
+    customer_scope = services.self_customer_id(db, principal)
+    customer_filter = [models.Customer.id == customer_scope] if services.is_restricted_principal(principal) else []
+    subscription_filter = [models.Subscription.customer_id == customer_scope] if services.is_restricted_principal(principal) else []
+    invoice_filter = [models.Invoice.customer_id == customer_scope] if services.is_restricted_principal(principal) else []
+    payment_filter = [models.Payment.customer_id == customer_scope] if services.is_restricted_principal(principal) else []
+    customers = db.scalar(select(func.count()).select_from(models.Customer).where(models.Customer.organization_id == org, models.Customer.status == "active", *customer_filter)) or 0
+    subscriptions = db.scalar(select(func.count()).select_from(models.Subscription).where(models.Subscription.organization_id == org, models.Subscription.status == "active", *subscription_filter)) or 0
+    overdue = db.scalar(select(func.count()).select_from(models.Invoice).where(models.Invoice.organization_id == org, models.Invoice.status == "overdue", *invoice_filter)) or 0
+    invoices = db.scalars(select(models.Invoice).where(models.Invoice.organization_id == org, models.Invoice.status != "void", *invoice_filter)).all()
     revenue = sum(services.invoice_amounts(db, invoice)["paid_minor"] for invoice in invoices)
-    recent_subscriptions = db.scalars(select(models.Subscription).where(models.Subscription.organization_id == org).order_by(models.Subscription.created_at.desc()).limit(5)).all()
-    recent_payments = db.scalars(select(models.Payment).where(models.Payment.organization_id == org).order_by(models.Payment.received_at.desc()).limit(5)).all()
+    recent_subscriptions = db.scalars(select(models.Subscription).where(models.Subscription.organization_id == org, *subscription_filter).order_by(models.Subscription.created_at.desc()).limit(5)).all()
+    recent_payments = db.scalars(select(models.Payment).where(models.Payment.organization_id == org, *payment_filter).order_by(models.Payment.received_at.desc()).limit(5)).all()
     return ok({"metrics": {"active_customers": customers, "active_subscriptions": subscriptions, "collected_revenue_minor": revenue, "overdue_invoices": overdue}, "recent_subscriptions": [services.public(x) for x in recent_subscriptions], "recent_payments": [services.public(x) for x in recent_payments]}, request)
 
 
 @app.get("/api/v1/subscription/customers", tags=["Customers"])
 def customers(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 20, q: str | None = None) -> dict[str, Any]:
-    rows, total = services.list_page(db, models.Customer, principal.organization_id, page, min(page_size, 100), q, models.Customer.display_name)
-    return paged(rows, total, page, min(page_size, 100), request)
+    page_size = min(page_size, 100)
+    rows, total = services.list_page(db, models.Customer, principal.organization_id, page, page_size, q, models.Customer.display_name, services.self_customer_id(db, principal) if services.is_restricted_principal(principal) else None)
+    return paged(rows, total, page, page_size, request)
 
 
 @app.post("/api/v1/subscription/customers", status_code=201, tags=["Customers"])
@@ -143,6 +303,8 @@ def create_customer(payload: schemas.CustomerCreate, request: Request, db: DBSes
 @app.get("/api/v1/subscription/customers/{customer_id}", tags=["Customers"])
 def customer_detail(customer_id: str, request: Request, db: DBSession, principal: ReadPrincipal) -> dict[str, Any]:
     customer = services.one(db, models.Customer, principal.organization_id, customer_id)
+    if services.is_restricted_principal(principal) and customer.id != services.self_customer_id(db, principal):
+        raise HTTPException(404, "Resource not found")
     payload = services.public(customer)
     payload["subscriptions"] = [services.public(row) for row in db.scalars(select(models.Subscription).where(models.Subscription.customer_id == customer.id, models.Subscription.organization_id == principal.organization_id)).all()]
     return ok(payload, request)
@@ -171,13 +333,114 @@ def archive_customer(customer_id: str, request: Request, db: DBSession, principa
 
 @app.get("/api/v1/subscription/plans", tags=["Plans"])
 def plans(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 50) -> dict[str, Any]:
-    rows, total = services.list_page(db, models.Plan, principal.organization_id, page, min(page_size, 100))
+    page_size = min(page_size, 100)
+    filters = [models.Plan.organization_id == principal.organization_id]
+    if services.is_restricted_principal(principal):
+        filters.append(models.Plan.status == "active")
+    total = db.scalar(select(func.count()).select_from(models.Plan).where(*filters)) or 0
+    rows = db.scalars(select(models.Plan).where(*filters).order_by(models.Plan.created_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
     result = []
     for plan in rows:
         payload = services.public(plan)
-        payload["prices"] = [services.public(price) for price in db.scalars(select(models.PlanPrice).where(models.PlanPrice.plan_id == plan.id, models.PlanPrice.organization_id == principal.organization_id)).all()]
+        price_filters = [models.PlanPrice.plan_id == plan.id, models.PlanPrice.organization_id == principal.organization_id]
+        if services.is_restricted_principal(principal):
+            price_filters.append(models.PlanPrice.status == "active")
+        payload["prices"] = [services.public(price) for price in db.scalars(select(models.PlanPrice).where(*price_filters)).all()]
+        payload["features"] = services.plan_feature_public(db, plan.id, principal.organization_id, active_only=services.is_restricted_principal(principal))
+        for price_payload in payload["prices"]:
+            price_payload["features"] = services.plan_feature_public(db, plan.id, principal.organization_id, active_only=services.is_restricted_principal(principal), billing_interval=price_payload["billing_interval"])
         result.append(payload)
-    return ok(result, request, {"page": page, "page_size": min(page_size, 100), "total": total})
+    return ok(result, request, {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size})
+
+
+@app.get("/api/v1/subscription/features", tags=["Plans"])
+def features(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 100) -> dict[str, Any]:
+    page_size = min(page_size, 100)
+    filters = [models.Feature.organization_id == principal.organization_id]
+    if services.is_restricted_principal(principal):
+        filters.append(models.Feature.status == "active")
+        customer_id = services.self_customer_id(db, principal)
+        plan_ids = select(models.Subscription.plan_id).where(models.Subscription.organization_id == principal.organization_id, models.Subscription.customer_id == customer_id, models.Subscription.status.not_in(["cancelled", "expired"]))
+        filters.append(models.Feature.id.in_(select(models.PlanFeature.feature_id).where(models.PlanFeature.organization_id == principal.organization_id, models.PlanFeature.plan_id.in_(plan_ids))))
+    total = db.scalar(select(func.count()).select_from(models.Feature).where(*filters)) or 0
+    rows = db.scalars(select(models.Feature).where(*filters).order_by(models.Feature.created_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
+    return paged(list(rows), total, page, page_size, request)
+
+
+@app.post("/api/v1/subscription/features", status_code=201, tags=["Plans"])
+def create_feature(payload: schemas.FeatureCreate, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    if db.scalar(select(models.Feature).where(models.Feature.organization_id == principal.organization_id, models.Feature.feature_code == payload.feature_code)):
+        raise HTTPException(409, "A feature with that code already exists")
+    feature = models.Feature(organization_id=principal.organization_id, **payload.model_dump(), created_by=principal.user_id, updated_by=principal.user_id)
+    db.add(feature)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "A feature with that code already exists") from exc
+    services.activity(db, principal, "feature", feature.id, "created", request_id(request))
+    db.commit()
+    return ok(services.public(feature), request)
+
+
+@app.patch("/api/v1/subscription/features/{feature_id}", tags=["Plans"])
+def update_feature(feature_id: str, payload: schemas.FeatureUpdate, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    feature = services.one(db, models.Feature, principal.organization_id, feature_id)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(feature, field, value)
+    feature.updated_by = principal.user_id
+    services.activity(db, principal, "feature", feature.id, "updated", request_id(request))
+    db.commit()
+    return ok(services.public(feature), request)
+
+
+@app.delete("/api/v1/subscription/features/{feature_id}", tags=["Plans"])
+def remove_feature(feature_id: str, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    feature = services.one(db, models.Feature, principal.organization_id, feature_id)
+    links = db.scalar(select(func.count()).select_from(models.PlanFeature).where(models.PlanFeature.organization_id == principal.organization_id, models.PlanFeature.feature_id == feature.id)) or 0
+    if links:
+        feature.status = "archived"
+        feature.updated_by = principal.user_id
+        services.activity(db, principal, "feature", feature.id, "archived", request_id(request), {"reason": "remove_requested", "plan_links": links})
+        db.commit()
+        payload = services.public(feature)
+        payload["action"] = "archived"
+        return ok(payload, request)
+    db.delete(feature)
+    services.activity(db, principal, "feature", feature.id, "deleted", request_id(request), {"reason": "remove_requested"})
+    db.commit()
+    return ok({"id": feature.id, "action": "deleted"}, request)
+
+
+@app.put("/api/v1/subscription/plans/{plan_id}/features", tags=["Plans"])
+def upsert_plan_feature(plan_id: str, payload: schemas.PlanFeatureUpdate, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    plan = services.one(db, models.Plan, principal.organization_id, plan_id)
+    feature = services.one(db, models.Feature, principal.organization_id, payload.feature_id)
+    link = db.scalar(select(models.PlanFeature).where(models.PlanFeature.organization_id == principal.organization_id, models.PlanFeature.plan_id == plan.id, models.PlanFeature.feature_id == feature.id))
+    values = payload.model_dump(exclude={"feature_id"})
+    if link:
+        for field, value in values.items():
+            setattr(link, field, value)
+        link.updated_by = principal.user_id
+    else:
+        link = models.PlanFeature(organization_id=principal.organization_id, plan_id=plan.id, feature_id=feature.id, **values, created_by=principal.user_id, updated_by=principal.user_id)
+        db.add(link)
+    db.flush()
+    services.activity(db, principal, "plan_feature", link.id, "updated", request_id(request), {"plan_id": plan.id, "feature_id": feature.id})
+    db.commit()
+    return ok(services.plan_feature_public(db, plan.id, principal.organization_id), request)
+
+
+@app.delete("/api/v1/subscription/plans/{plan_id}/features/{feature_id}", tags=["Plans"])
+def remove_plan_feature(plan_id: str, feature_id: str, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    plan = services.one(db, models.Plan, principal.organization_id, plan_id)
+    link = db.scalar(select(models.PlanFeature).where(models.PlanFeature.organization_id == principal.organization_id, models.PlanFeature.plan_id == plan.id, models.PlanFeature.feature_id == feature_id))
+    if not link:
+        raise HTTPException(404, "Plan feature not found")
+    db.delete(link)
+    services.activity(db, principal, "plan_feature", link.id, "deleted", request_id(request), {"plan_id": plan.id, "feature_id": feature_id})
+    db.commit()
+    return ok({"plan_id": plan.id, "feature_id": feature_id, "action": "deleted"}, request)
 
 
 @app.post("/api/v1/subscription/plans", status_code=201, tags=["Plans"])
@@ -205,18 +468,195 @@ def update_plan(plan_id: str, payload: schemas.PlanUpdate, request: Request, db:
     return ok(services.public(plan), request)
 
 
+@app.delete("/api/v1/subscription/plans/{plan_id}", tags=["Plans"])
+def remove_plan(plan_id: str, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    """Remove a plan without breaking historical subscriptions.
+
+    A plan referenced by any subscription, or an active plan, is archived.
+    Only an unused draft or inactive plan is physically deleted, along with
+    its prices and feature links.
+    """
+    plan = services.one(db, models.Plan, principal.organization_id, plan_id)
+    subscription_count = db.scalar(
+        select(func.count()).select_from(models.Subscription).where(
+            models.Subscription.organization_id == principal.organization_id,
+            models.Subscription.plan_id == plan.id,
+        )
+    ) or 0
+    if subscription_count or plan.status == "active":
+        plan.status = "archived"
+        plan.updated_by = principal.user_id
+        services.activity(db, principal, "plan", plan.id, "archived", request_id(request), {"reason": "remove_requested", "subscription_count": subscription_count})
+        db.commit()
+        payload = services.public(plan)
+        payload["action"] = "archived"
+        return ok(payload, request)
+
+    db.execute(delete(models.PlanFeature).where(models.PlanFeature.organization_id == principal.organization_id, models.PlanFeature.plan_id == plan.id))
+    db.execute(delete(models.PlanPrice).where(models.PlanPrice.organization_id == principal.organization_id, models.PlanPrice.plan_id == plan.id))
+    services.activity(db, principal, "plan", plan.id, "deleted", request_id(request), {"reason": "remove_requested"})
+    db.delete(plan)
+    db.commit()
+    return ok({"id": plan.id, "action": "deleted"}, request)
+
+
+def validate_price_amounts(db: DBSession, plan: models.Plan, billing_interval: str, currency: str, list_amount_minor: int | None, unit_amount_minor: int, discount_bps: int) -> int:
+    list_amount = list_amount_minor if list_amount_minor is not None else unit_amount_minor
+    expected_amount = round(list_amount * (10000 - discount_bps) / 10000)
+    if expected_amount != unit_amount_minor:
+        raise HTTPException(422, "The final price must equal the list price after the configured discount")
+    if billing_interval == "year" and list_amount_minor is not None:
+        monthly = db.scalar(
+            select(models.PlanPrice).where(
+                models.PlanPrice.organization_id == plan.organization_id,
+                models.PlanPrice.plan_id == plan.id,
+                models.PlanPrice.billing_interval == "month",
+                models.PlanPrice.currency == currency,
+                models.PlanPrice.status == "active",
+            ).order_by(models.PlanPrice.effective_from.desc())
+        )
+        if monthly and monthly.list_amount_minor is not None and discount_bps <= monthly.discount_bps:
+            raise HTTPException(409, "Annual discount must be greater than the monthly discount")
+    return list_amount
+
+
 @app.post("/api/v1/subscription/plans/{plan_id}/prices", status_code=201, tags=["Plans"])
 def create_price(plan_id: str, payload: schemas.PriceCreate, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
     plan = services.one(db, models.Plan, principal.organization_id, plan_id)
+    list_amount_minor = validate_price_amounts(db, plan, payload.billing_interval, payload.currency, payload.list_amount_minor, payload.unit_amount_minor, payload.discount_bps)
     if payload.is_default:
         for old in db.scalars(select(models.PlanPrice).where(models.PlanPrice.plan_id == plan.id, models.PlanPrice.organization_id == principal.organization_id, models.PlanPrice.billing_interval == payload.billing_interval, models.PlanPrice.currency == payload.currency)).all():
             old.is_default = False
-    price = models.PlanPrice(organization_id=principal.organization_id, plan_id=plan.id, **payload.model_dump(), created_by=principal.user_id, updated_by=principal.user_id)
+    values = payload.model_dump()
+    values["list_amount_minor"] = list_amount_minor
+    price = models.PlanPrice(organization_id=principal.organization_id, plan_id=plan.id, **values, created_by=principal.user_id, updated_by=principal.user_id)
     db.add(price)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "A price with that code already exists") from exc
     services.activity(db, principal, "plan_price", price.id, "created", request_id(request))
     db.commit()
     return ok(services.public(price), request)
+
+
+@app.patch("/api/v1/subscription/plans/{plan_id}/prices/{price_id}", tags=["Plans"])
+def update_price(plan_id: str, price_id: str, payload: schemas.PriceUpdate, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    plan = services.one(db, models.Plan, principal.organization_id, plan_id)
+    price = services.one(db, models.PlanPrice, principal.organization_id, price_id)
+    if price.plan_id != plan.id:
+        raise HTTPException(404, "Price not found")
+    used = db.scalar(
+        select(func.count()).select_from(models.Subscription).where(
+            models.Subscription.organization_id == principal.organization_id,
+            models.Subscription.plan_price_id == price.id,
+        )
+    ) or 0
+    changes = payload.model_dump(exclude_unset=True)
+    commercial_fields = {"list_amount_minor", "unit_amount_minor", "setup_fee_minor", "effective_from", "discount_bps"}
+    if used and commercial_fields.intersection(changes):
+        raise HTTPException(409, "A price used by a subscription is immutable; create a new price instead")
+    existing_list = price.list_amount_minor if price.list_amount_minor is not None else price.unit_amount_minor
+    candidate_list = changes.get("list_amount_minor", existing_list)
+    candidate_unit = changes.get("unit_amount_minor", price.unit_amount_minor)
+    candidate_discount = changes.get("discount_bps", price.discount_bps)
+    validate_price_amounts(db, plan, price.billing_interval, price.currency, candidate_list, candidate_unit, candidate_discount)
+    if changes.get("status") == "archived" and price.is_default:
+        replacement = db.scalar(
+            select(models.PlanPrice).where(
+                models.PlanPrice.organization_id == principal.organization_id,
+                models.PlanPrice.plan_id == plan.id,
+                models.PlanPrice.billing_interval == price.billing_interval,
+                models.PlanPrice.currency == price.currency,
+                models.PlanPrice.id != price.id,
+                models.PlanPrice.status == "active",
+            )
+        )
+        if not replacement:
+            raise HTTPException(409, "Create another active price for this billing interval before archiving the default")
+    if changes.get("is_default") is False and price.is_default:
+        replacement = db.scalar(
+            select(models.PlanPrice).where(
+                models.PlanPrice.organization_id == principal.organization_id,
+                models.PlanPrice.plan_id == plan.id,
+                models.PlanPrice.billing_interval == price.billing_interval,
+                models.PlanPrice.currency == price.currency,
+                models.PlanPrice.id != price.id,
+                models.PlanPrice.status == "active",
+            )
+        )
+        if not replacement:
+            raise HTTPException(409, "Keep a default price for this billing interval or designate another active price first")
+    if changes.get("is_default"):
+        for old in db.scalars(
+            select(models.PlanPrice).where(
+                models.PlanPrice.plan_id == plan.id,
+                models.PlanPrice.organization_id == principal.organization_id,
+                models.PlanPrice.billing_interval == price.billing_interval,
+                models.PlanPrice.currency == price.currency,
+                models.PlanPrice.id != price.id,
+            )
+        ).all():
+            old.is_default = False
+    for field, value in changes.items():
+        setattr(price, field, value)
+    price.updated_by = principal.user_id
+    services.activity(db, principal, "plan_price", price.id, "updated", request_id(request), {"used_by_subscriptions": used})
+    db.commit()
+    return ok(services.public(price), request)
+
+
+@app.delete("/api/v1/subscription/plans/{plan_id}/prices/{price_id}", tags=["Plans"])
+def remove_price(plan_id: str, price_id: str, request: Request, db: DBSession, principal: AdminPrincipal) -> dict[str, Any]:
+    plan = services.one(db, models.Plan, principal.organization_id, plan_id)
+    price = services.one(db, models.PlanPrice, principal.organization_id, price_id)
+    if price.plan_id != plan.id:
+        raise HTTPException(404, "Price not found")
+    used = db.scalar(
+        select(func.count()).select_from(models.Subscription).where(
+            models.Subscription.organization_id == principal.organization_id,
+            models.Subscription.plan_price_id == price.id,
+        )
+    ) or 0
+    if used:
+        replacement = None
+        if price.is_default:
+            replacement = db.scalar(
+                select(models.PlanPrice).where(
+                    models.PlanPrice.organization_id == principal.organization_id,
+                    models.PlanPrice.plan_id == plan.id,
+                    models.PlanPrice.billing_interval == price.billing_interval,
+                    models.PlanPrice.currency == price.currency,
+                    models.PlanPrice.id != price.id,
+                    models.PlanPrice.status == "active",
+                )
+            )
+            if not replacement:
+                raise HTTPException(409, "Create another active price for this billing interval before removing the default")
+        price.status = "archived"
+        price.updated_by = principal.user_id
+        if price.is_default:
+            price.is_default = False
+        services.activity(db, principal, "plan_price", price.id, "archived", request_id(request), {"reason": "remove_requested", "used_by_subscriptions": used})
+        db.commit()
+        payload = services.public(price)
+        payload["action"] = "archived"
+        return ok(payload, request)
+    if plan.status == "active" and price.status == "active":
+        active_price_count = db.scalar(
+            select(func.count()).select_from(models.PlanPrice).where(
+                models.PlanPrice.organization_id == principal.organization_id,
+                models.PlanPrice.plan_id == plan.id,
+                models.PlanPrice.status == "active",
+            )
+        ) or 0
+        if active_price_count <= 1:
+            raise HTTPException(409, "An active plan must keep at least one active price")
+    db.delete(price)
+    services.activity(db, principal, "plan_price", price.id, "deleted", request_id(request), {"reason": "remove_requested"})
+    db.commit()
+    return ok({"id": price.id, "action": "deleted"}, request)
 
 
 @app.patch("/api/v1/subscription/plans/{plan_id}/status", tags=["Plans"])
@@ -235,6 +675,8 @@ def set_plan_status(plan_id: str, payload: schemas.PlanStatus, request: Request,
 @app.get("/api/v1/subscription/subscriptions", tags=["Subscriptions"])
 def subscriptions(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 20, status_filter: str | None = None) -> dict[str, Any]:
     filters = [models.Subscription.organization_id == principal.organization_id]
+    if services.is_restricted_principal(principal):
+        filters.append(models.Subscription.customer_id == services.self_customer_id(db, principal))
     if status_filter:
         filters.append(models.Subscription.status == status_filter)
     total = db.scalar(select(func.count()).select_from(models.Subscription).where(*filters)) or 0
@@ -347,19 +789,77 @@ def update_auto_renew(subscription_id: str, payload: schemas.AutoRenewCommand, r
     return ok(services.public(subscription), request)
 
 
+def self_subscription(subscription_id: str, db: DBSession, principal: ReadPrincipal) -> models.Subscription:
+    if not services.is_restricted_principal(principal):
+        raise HTTPException(403, "This self-service endpoint is only available to subscriber users")
+    subscription = services.one(db, models.Subscription, principal.organization_id, subscription_id)
+    if subscription.customer_id != services.self_customer_id(db, principal):
+        raise HTTPException(404, "Resource not found")
+    return subscription
+
+
+@app.post("/api/v1/subscription/me/subscriptions/{subscription_id}/schedule-cancellation", tags=["Subscriptions"])
+def self_schedule_cancellation(subscription_id: str, payload: schemas.VersionedCommand, request: Request, db: DBSession, principal: ReadPrincipal) -> dict[str, Any]:
+    self_subscription(subscription_id, db, principal)
+    return versioned_subscription(subscription_id, payload, request, db, principal, "schedule_cancel")
+
+
+@app.post("/api/v1/subscription/me/subscriptions/{subscription_id}/revoke-cancellation", tags=["Subscriptions"])
+def self_revoke_cancellation(subscription_id: str, payload: schemas.VersionedCommand, request: Request, db: DBSession, principal: ReadPrincipal) -> dict[str, Any]:
+    self_subscription(subscription_id, db, principal)
+    return versioned_subscription(subscription_id, payload, request, db, principal, "revoke_cancel")
+
+
+@app.post("/api/v1/subscription/me/subscriptions/{subscription_id}/schedule-plan-change", tags=["Subscriptions"])
+def self_schedule_plan_change(subscription_id: str, payload: schemas.PlanChangeCommand, request: Request, db: DBSession, principal: ReadPrincipal) -> dict[str, Any]:
+    subscription = self_subscription(subscription_id, db, principal)
+    if subscription.version != payload.expected_version:
+        raise HTTPException(409, "Subscription version conflict")
+    target = services.one(db, models.PlanPrice, principal.organization_id, payload.target_plan_price_id)
+    target_plan = services.one(db, models.Plan, principal.organization_id, target.plan_id)
+    if target.status != "active" or target_plan.status != "active":
+        raise HTTPException(409, "Target price must be active")
+    subscription.pending_plan_id, subscription.pending_plan_price_id = target_plan.id, target.id
+    subscription.plan_change_effective_at = subscription.current_period_end or subscription.trial_end_at
+    subscription.version += 1
+    services.event(db, principal, subscription, "plan_change_scheduled", subscription.status, payload.reason, request_id(request))
+    db.commit()
+    return ok(services.public(subscription), request)
+
+
+@app.patch("/api/v1/subscription/me/subscriptions/{subscription_id}/auto-renew", tags=["Subscriptions"])
+def self_update_auto_renew(subscription_id: str, payload: schemas.AutoRenewCommand, request: Request, db: DBSession, principal: ReadPrincipal) -> dict[str, Any]:
+    subscription = self_subscription(subscription_id, db, principal)
+    if subscription.version != payload.expected_version:
+        raise HTTPException(409, "Subscription version conflict")
+    if subscription.status in {"cancelled", "expired"}:
+        raise HTTPException(409, "Ended subscriptions cannot change auto renewal")
+    subscription.auto_renew = payload.auto_renew
+    subscription.version += 1
+    subscription.updated_by = principal.user_id
+    services.event(db, principal, subscription, "auto_renew_updated", subscription.status, f"Auto renewal set to {payload.auto_renew}", request_id(request))
+    db.commit()
+    return ok(services.public(subscription), request)
+
+
 @app.get("/api/v1/subscription/invoices", tags=["Invoices"])
 def invoices(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 20, status_filter: str | None = None) -> dict[str, Any]:
     filters = [models.Invoice.organization_id == principal.organization_id]
+    if services.is_restricted_principal(principal):
+        filters.append(models.Invoice.customer_id == services.self_customer_id(db, principal))
     if status_filter:
         filters.append(models.Invoice.status == status_filter)
     total = db.scalar(select(func.count()).select_from(models.Invoice).where(*filters)) or 0
-    rows = db.scalars(select(models.Invoice).where(*filters).order_by(models.Invoice.created_at.desc()).offset((page-1)*min(page_size,100)).limit(min(page_size,100))).all()
-    return paged(list(rows), total, page, min(page_size, 100), request, lambda x: services.invoice_public(db, x))
+    page_size = min(page_size, 100)
+    rows = db.scalars(select(models.Invoice).where(*filters).order_by(models.Invoice.created_at.desc()).offset((page-1)*page_size).limit(page_size)).all()
+    return ok(services.invoice_public_many(db, list(rows)), request, {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size})
 
 
 @app.get("/api/v1/subscription/invoices/{invoice_id}", tags=["Invoices"])
 def invoice_detail(invoice_id: str, request: Request, db: DBSession, principal: ReadPrincipal) -> dict[str, Any]:
     invoice = services.one(db, models.Invoice, principal.organization_id, invoice_id)
+    if services.is_restricted_principal(principal) and invoice.customer_id != services.self_customer_id(db, principal):
+        raise HTTPException(404, "Resource not found")
     payload = services.invoice_public(db, invoice)
     payload["items"] = [services.public(item) for item in db.scalars(select(models.InvoiceItem).where(models.InvoiceItem.invoice_id == invoice.id, models.InvoiceItem.organization_id == principal.organization_id).order_by(models.InvoiceItem.line_number)).all()]
     return ok(payload, request)
@@ -415,8 +915,9 @@ def void_invoice(invoice_id: str, payload: schemas.VersionedCommand, request: Re
 
 @app.get("/api/v1/subscription/payments", tags=["Payments"])
 def payments(request: Request, db: DBSession, principal: ReadPrincipal, page: int = 1, page_size: int = 20) -> dict[str, Any]:
-    rows, total = services.list_page(db, models.Payment, principal.organization_id, page, min(page_size, 100))
-    return paged(rows, total, page, min(page_size, 100), request, lambda payment: services.payment_public(db, payment))
+    page_size = min(page_size, 100)
+    rows, total = services.list_page(db, models.Payment, principal.organization_id, page, page_size, customer_id=services.self_customer_id(db, principal) if services.is_restricted_principal(principal) else None)
+    return ok(services.payment_public_many(db, rows), request, {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size})
 
 
 def make_payment(payload: schemas.PaymentCreate, request: Request, db: DBSession, principal: BillingPrincipal, attempt_id: str | None = None) -> models.Payment:

@@ -19,6 +19,7 @@ bearer = HTTPBearer(auto_error=False)
 password_hash = PasswordHash.recommended()
 ADMIN_SCOPES = ["subscription:admin", "subscription:billing", "subscription:support", "subscription:reports", "subscription:read", "subscription:system"]
 MEMBER_SCOPES = ["subscription:read"]
+SUPER_ADMIN_SCOPE = "subscription:super_admin"
 
 
 class Principal(BaseModel):
@@ -26,12 +27,30 @@ class Principal(BaseModel):
     organization_id: str
     scopes: set[str]
     name: str
+    session_id: str | None = None
 
 
-def issue_token(user: models.User) -> str:
+def effective_scopes(user: models.User) -> set[str]:
+    scopes = set(user.scopes or [])
+    if user.email.lower() in get_settings().super_admin_email_set:
+        scopes.add(SUPER_ADMIN_SCOPE)
+    return scopes
+
+
+def role_for_user(user: models.User) -> str:
+    scopes = effective_scopes(user)
+    if SUPER_ADMIN_SCOPE in scopes:
+        return "super_admin"
+    if "subscription:admin" in scopes:
+        return "org_admin"
+    return "user"
+
+
+def issue_token(user: models.User, scopes: set[str] | None = None, session_id: str | None = None) -> str:
     settings = get_settings()
     now = datetime.now(timezone.utc)
-    return jwt.encode({"sub": user.id, "organization_id": user.organization_id, "scopes": user.scopes, "name": user.name, "iat": now, "exp": now + timedelta(minutes=settings.jwt_expiry_minutes)}, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    token_scopes = sorted(scopes if scopes is not None else effective_scopes(user))
+    return jwt.encode({"sub": user.id, "organization_id": user.organization_id, "scopes": token_scopes, "name": user.name, "jti": session_id or str(uuid.uuid4()), "iat": now, "exp": now + timedelta(minutes=settings.jwt_expiry_minutes)}, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
 def verify_password(password: str, hashed_password: str) -> bool:
@@ -51,7 +70,14 @@ def current_principal(credentials: Annotated[HTTPAuthorizationCredentials | None
         user = session.scalar(select(models.User).where(models.User.id == str(claims["sub"]), models.User.status == "active"))
         if not user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User account is inactive or no longer exists")
-        return Principal(user_id=user.id, organization_id=user.organization_id, scopes=set(user.scopes or []), name=user.name)
+        session_id = str(claims.get("jti") or "")
+        auth_session = session.get(models.AuthSession, session_id)
+        if not auth_session or auth_session.user_id != user.id or auth_session.revoked_at is not None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is no longer active")
+        expiry = auth_session.expires_at.replace(tzinfo=timezone.utc) if auth_session.expires_at.tzinfo is None else auth_session.expires_at
+        if expiry <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has expired")
+        return Principal(user_id=user.id, organization_id=user.organization_id, scopes=effective_scopes(user), name=user.name, session_id=session_id)
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired bearer token") from exc
 
