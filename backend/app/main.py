@@ -11,12 +11,12 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from . import models, schemas, services
-from .config import get_settings
+from .config import get_settings as runtime_settings
 from .db import Base, engine, secure_postgres_tables
 from .security import ADMIN_SCOPES, DBSession, MEMBER_SCOPES, Principal, SUPER_ADMIN_SCOPE, current_principal, effective_scopes, hash_password, issue_token, request_id, require_scope, role_for_user, verify_password
 
 
-settings = get_settings()
+settings = runtime_settings()
 
 
 @asynccontextmanager
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Argo Subscription Management API", version="1.0.0", lifespan=lifespan, openapi_tags=[{"name": name} for name in ["Infrastructure", "Authentication", "Dashboard", "Customers", "Plans", "Subscriptions", "Invoices", "Payment Attempts", "Payments", "Notifications", "Reports", "Settings", "Activity", "Maintenance"]])
+app = FastAPI(title="Argo Subscription Management API", version="1.0.0", lifespan=lifespan, openapi_tags=[{"name": name} for name in ["Infrastructure", "Authentication", "Dashboard", "Customers", "Plans", "Subscriptions", "Invoices", "Payment Attempts", "Payments", "Notifications", "Reports", "Settings", "Activity", "Maintenance", "Platform"]])
 app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=False, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"], expose_headers=["X-Request-ID"])
 
 
@@ -158,6 +158,49 @@ def platform_organizations(request: Request, db: DBSession, principal: PlatformP
         org_users = [user for user in users if user.organization_id == organization.id]
         result.append({"id": organization.id, "name": organization.name, "slug": organization.slug, "status": organization.status, "administrators": sum("subscription:admin" in (user.scopes or []) for user in org_users), "users": sum("subscription:admin" not in (user.scopes or []) for user in org_users), "created_at": organization.created_at.isoformat(), "updated_at": organization.updated_at.isoformat()})
     return ok(result, request, {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size})
+
+
+def platform_user_public(user: models.User, organization_name: str) -> dict[str, Any]:
+    payload = user_public(user)
+    payload["organization_name"] = organization_name
+    return payload
+
+
+@app.get("/api/v1/subscription/platform/users", tags=["Platform"])
+def platform_users(request: Request, db: DBSession, principal: PlatformPrincipal, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
+    total = db.scalar(select(func.count()).select_from(models.User)) or 0
+    rows = db.scalars(select(models.User).order_by(models.User.created_at.desc()).offset((page - 1) * page_size).limit(page_size)).all()
+    organizations = {organization.id: organization.name for organization in db.scalars(select(models.Organization)).all()}
+    return ok([platform_user_public(user, organizations.get(user.organization_id, "Unknown organization")) for user in rows], request, {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size})
+
+
+@app.post("/api/v1/subscription/platform/users", status_code=201, tags=["Platform"])
+def create_platform_user(payload: schemas.PlatformUserCreate, request: Request, db: DBSession, principal: PlatformPrincipal) -> dict[str, Any]:
+    organization = db.get(models.Organization, payload.organization_id)
+    if not organization:
+        raise HTTPException(404, "Organization not found")
+    if organization.status != "active":
+        raise HTTPException(409, "Users can only be created in an active organization")
+    email = str(payload.email).lower()
+    if email in runtime_settings().super_admin_email_set:
+        raise HTTPException(403, "Super Admin accounts are managed by the platform allowlist")
+    if db.scalar(select(models.User).where(func.lower(models.User.email) == email)):
+        raise HTTPException(status.HTTP_409_CONFLICT, "An account with that email already exists")
+    user = models.User(
+        organization_id=organization.id,
+        email=email,
+        name=payload.name.strip(),
+        password_hash=hash_password(payload.password),
+        scopes=ADMIN_SCOPES.copy() if payload.role == "org_admin" else MEMBER_SCOPES.copy(),
+    )
+    db.add(user)
+    db.flush()
+    audit_principal = Principal(user_id=principal.user_id, organization_id=organization.id, scopes=principal.scopes, name=principal.name)
+    services.activity(db, audit_principal, "user", user.id, "user_created", request_id(request), {"role": payload.role, "source": "super_admin"})
+    db.commit()
+    return ok(platform_user_public(user, organization.name), request)
 
 
 @app.get("/api/v1/subscription/platform/reports", tags=["Platform"])

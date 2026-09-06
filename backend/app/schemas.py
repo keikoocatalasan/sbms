@@ -19,6 +19,14 @@ class SignupRequest(APIModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class PlatformUserCreate(APIModel):
+    organization_id: str = Field(min_length=1, max_length=36)
+    name: str = Field(min_length=2, max_length=160)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    role: Literal["user", "org_admin"] = "user"
+
+
 class CustomerCreate(APIModel):
     display_name: str = Field(min_length=1, max_length=160)
     customer_type: Literal["individual", "organization"] = "individual"

@@ -1,9 +1,9 @@
 import { FormEvent, useEffect, useState } from 'react'
-import { AlertCircle, LoaderCircle, Pencil, Plus, Trash2 } from 'lucide-react'
+import { AlertCircle, Eye, EyeOff, LoaderCircle, Pencil, Plus, Trash2 } from 'lucide-react'
 import { api, apiMessage, requestKey } from './api'
 import { ConfirmDialog, downloadCsv, EmptyState, Modal, money, shortDate, Status } from './components'
 import { useAppData } from './app-data'
-import type { Customer, Envelope, Feature, Invoice, Payment, Plan, PlanPrice, Subscription } from './types'
+import type { Customer, Envelope, Feature, Invoice, Payment, Plan, PlanPrice, PlatformOrganization, Subscription } from './types'
 
 type DialogProps = { onClose: () => void; onDone: (message: string) => Promise<void> | void }
 
@@ -13,6 +13,30 @@ function FormError({ message }: { message: string }) {
 
 function SubmitButton({ busy, label = 'Save' }: { busy: boolean; label?: string }) {
   return <button className="button primary" disabled={busy}>{busy ? <><LoaderCircle className="spin" size={16}/> Saving</> : label}</button>
+}
+
+export function PlatformUserDialog({ organizations, onClose, onDone }: DialogProps & { organizations: PlatformOrganization[] }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setBusy(true); setError('')
+    const form = new FormData(event.currentTarget)
+    try {
+      await api.post('/platform/users', { organization_id: form.get('organization_id'), name: form.get('name'), email: form.get('email'), password: form.get('password'), role: form.get('role') })
+      await onDone('User created. Share the temporary password securely; it will not be shown again.'); onClose()
+    } catch (caught) { setError(apiMessage(caught, 'Unable to create the platform user.')) } finally { setBusy(false) }
+  }
+  return <Modal wide title="Create platform user" description="Create a subscriber or organization administrator inside an active organization. Super Admin accounts are managed through the platform allowlist." onClose={onClose}>
+    <form onSubmit={submit} className="form-grid">
+      <label>Organization<select name="organization_id" required defaultValue=""><option value="" disabled>Select organization</option>{organizations.filter(item => item.status === 'active').map(organization => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></label>
+      <label>Role<select name="role" defaultValue="user"><option value="user">Subscriber user</option><option value="org_admin">Organization administrator</option></select></label>
+      <label>Full name<input name="name" required minLength={2} maxLength={160} autoComplete="name"/></label>
+      <label>Email<input name="email" type="email" required autoComplete="username"/></label>
+      <label className="span-2">Temporary password<div className="login-password-field"><input name="password" type={showPassword ? 'text' : 'password'} required minLength={8} maxLength={128} autoComplete="new-password"/><button type="button" className="login-password-toggle" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword(value => !value)}>{showPassword ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><small className="form-hint">The password is stored securely and is not returned after creation.</small></label>
+      <FormError message={error}/><div className="modal-actions span-2"><button type="button" className="button" onClick={onClose}>Cancel</button><SubmitButton busy={busy} label="Create user"/></div>
+    </form>
+  </Modal>
 }
 
 export function CustomerDialog({ customer, onClose, onDone }: DialogProps & { customer?: Customer }) {

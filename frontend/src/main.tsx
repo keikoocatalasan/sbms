@@ -7,8 +7,8 @@ import './styles.css'
 import { api, apiMessage, clearSession, readUser, requestKey, saveSession, tokenKey } from './api'
 import { AppDataProvider, useAppData } from './app-data'
 import { ConfirmDialog, DataTable, downloadCsv, EmptyState, ErrorState, ExportButton, LoadingState, Metric, Modal, money, shortDate, Status, Toast } from './components'
-import { CustomerDialog, CustomerProfileDialog, FeatureCatalogDialog, InvoiceDetailDialog, InvoiceDialog, NotificationDialog, PaymentAllocationDialog, PaymentDialog, PlanDialog, PlanFeaturesDialog, PlanPriceDialog, SubscriptionCommandDialog, SubscriptionDialog } from './dialogs'
-import type { AuthUser, Customer, Envelope, Invoice, Notification, Payment, Plan, PlanPrice, PlatformOrganization, Subscription, SystemSettings, TeamUser } from './types'
+import { CustomerDialog, CustomerProfileDialog, FeatureCatalogDialog, InvoiceDetailDialog, InvoiceDialog, NotificationDialog, PaymentAllocationDialog, PaymentDialog, PlatformUserDialog, PlanDialog, PlanFeaturesDialog, PlanPriceDialog, SubscriptionCommandDialog, SubscriptionDialog } from './dialogs'
+import type { AuthUser, Customer, Envelope, Invoice, Notification, Payment, Plan, PlanPrice, PlatformOrganization, PlatformUser, Subscription, SystemSettings, TeamUser } from './types'
 
 type IconType = typeof LayoutDashboard
 type ToastState = { message: string; error?: boolean } | null
@@ -44,6 +44,7 @@ const pageCopy: Record<string, string> = {
   '/portal/profile': 'Manage your account details',
   '/super-admin/dashboard': 'Platform-wide organization and account health',
   '/super-admin/organizations': 'Review tenant status and account counts',
+  '/super-admin/users': 'Create and review platform user access',
   '/super-admin/reports': 'Review platform-level subscription aggregates',
   '/super-admin/notifications': 'Review platform alerts',
 }
@@ -427,13 +428,13 @@ function PlatformShell({ user, children }: { user: AuthUser; children: React.Rea
   const location = useLocation()
   const [collapsed, setCollapsed] = useState(false)
   const signOut = () => { void api.post('/auth/logout').catch(() => undefined).finally(() => { clearSession(); navigate('/login', { replace: true }) }) }
-  const links = [{ path: '/super-admin/dashboard', label: 'Dashboard', icon: LayoutDashboard }, { path: '/super-admin/organizations', label: 'Organizations', icon: Building2 }, { path: '/super-admin/reports', label: 'Reports', icon: LineChart }, { path: '/super-admin/notifications', label: 'Notifications', icon: Bell }]
+  const links = [{ path: '/super-admin/dashboard', label: 'Dashboard', icon: LayoutDashboard }, { path: '/super-admin/organizations', label: 'Organizations', icon: Building2 }, { path: '/super-admin/users', label: 'Users', icon: Users }, { path: '/super-admin/reports', label: 'Reports', icon: LineChart }, { path: '/super-admin/notifications', label: 'Notifications', icon: Bell }]
   return <div className={`platform-shell ${collapsed ? 'collapsed' : ''}`}><aside><Link className="brand" to="/super-admin/dashboard"><span className="brand-logo"><ShieldCheck size={22}/></span><b>SUPER ADMIN</b></Link><button type="button" className="hamburger" aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-expanded={!collapsed} onClick={() => setCollapsed(value => !value)}><Menu/></button><nav>{links.map(({ path, label, icon: Icon }) => <Link key={path} to={path} className={location.pathname === path ? 'selected' : ''}><Icon size={20}/><span>{label}</span></Link>)}</nav><div className="side-footer">Platform administration</div><button type="button" className="logout" onClick={signOut}>Sign out</button></aside>{collapsed && <button type="button" className="mobile-overlay" aria-label="Close navigation" onClick={() => setCollapsed(false)}/>}<main><header><button type="button" className="mobile-menu" aria-label="Open navigation" onClick={() => setCollapsed(true)}><Menu/></button><div className="header-spacer"/><span className="platform-user"><span className="profile-photo">{user.name[0]}</span><b>{user.name}</b></span></header>{children}</main></div>
 }
 
-function PlatformPage({ title, children }: { title: string; children: React.ReactNode }) {
+function PlatformPage({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }) {
   const location = useLocation()
-  return <section className="content platform-content"><div className="page-head"><div><h1>{title}</h1><p>{pageCopy[location.pathname] || 'Platform administration'}</p></div></div>{children}</section>
+  return <section className="content platform-content"><div className="page-head"><div><h1>{title}</h1><p>{pageCopy[location.pathname] || 'Platform administration'}</p></div>{action && <div className="page-actions">{action}</div>}</div>{children}</section>
 }
 
 function PlatformDashboardPage() {
@@ -454,6 +455,33 @@ function PlatformOrganizationsPage() {
   return <PlatformPage title="Organizations">{loading ? <LoadingState label="Loading organizations"/> : error ? <ErrorState message={error} onRetry={() => void load()}/> : <section className="card table-card"><DataTable rows={organizations} rowKey={row => row.id} searchPlaceholder="Search organizations" searchText={row => `${row.name} ${row.slug}`} statusOf={row => row.status} statuses={['active', 'suspended', 'inactive']} columns={[{ key: 'name', label: 'Organization', render: row => <span className="person"><i className="avatar-square">{row.name.slice(0, 2).toUpperCase()}</i><span>{row.name}<small>{row.slug}</small></span></span> }, { key: 'admins', label: 'Administrators', render: row => row.administrators }, { key: 'users', label: 'Users', render: row => row.users }, { key: 'status', label: 'Status', render: row => <Status>{row.status}</Status> }, { key: 'created', label: 'Created', render: row => shortDate(row.created_at) }]}/></section>}</PlatformPage>
 }
 
+function PlatformUsersPage() {
+  const [users, setUsers] = useState<PlatformUser[]>([])
+  const [organizations, setOrganizations] = useState<PlatformOrganization[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [toast, setToast] = useState('')
+  async function load() {
+    setLoading(true); setError('')
+    try {
+      const [usersResponse, organizationsResponse] = await Promise.all([
+        api.get<Envelope<PlatformUser[]>>('/platform/users?page_size=100'),
+        api.get<Envelope<PlatformOrganization[]>>('/platform/organizations?page_size=100'),
+      ])
+      setUsers(usersResponse.data.data)
+      setOrganizations(organizationsResponse.data.data)
+    } catch (caught) { setError(apiMessage(caught, 'Unable to load platform users.')) } finally { setLoading(false) }
+  }
+  useEffect(() => { void load() }, [])
+  const roleLabel = (role: PlatformUser['role']) => role === 'super_admin' ? 'Super Admin' : role === 'org_admin' ? 'Organization administrator' : 'Subscriber user'
+  const createDone = async (message: string) => { await load(); setToast(message) }
+  return <PlatformPage title="Users" action={<button type="button" className="button primary" onClick={() => setDialogOpen(true)} disabled={!organizations.some(item => item.status === 'active')}><Plus size={16}/>Create user</button>}>
+    {loading ? <LoadingState label="Loading platform users"/> : error ? <ErrorState message={error} onRetry={() => void load()}/> : <section className="card table-card"><DataTable rows={users} rowKey={row => row.id} searchPlaceholder="Search users" searchText={row => `${row.name} ${row.email} ${row.organization_name} ${roleLabel(row.role)}`} statusOf={row => row.status} statuses={['active', 'suspended', 'inactive']} columns={[{ key: 'user', label: 'User', render: row => <span className="person"><i className="avatar-square">{row.name.slice(0, 2).toUpperCase()}</i><span>{row.name}<small>{row.email}</small></span></span> }, { key: 'organization', label: 'Organization', render: row => row.organization_name }, { key: 'role', label: 'Role', render: row => roleLabel(row.role) }, { key: 'status', label: 'Status', render: row => <Status>{row.status}</Status> }, { key: 'created', label: 'Created', render: row => shortDate(row.created_at) }]}/></section>}
+    {dialogOpen && <PlatformUserDialog organizations={organizations} onClose={() => setDialogOpen(false)} onDone={createDone}/>} {toast && <Toast message={toast} onClose={() => setToast('')}/>}
+  </PlatformPage>
+}
+
 function PlatformReportsPage() {
   const [report, setReport] = useState<{ organizations: number; active_organizations: number; subscriptions: number; active_subscriptions: number; trialing_subscriptions: number; outstanding_minor: number } | null>(null)
   const [error, setError] = useState('')
@@ -466,7 +494,7 @@ function PlatformNotificationsPage() {
 }
 
 function PlatformApp({ user }: { user: AuthUser }) {
-  return <PlatformShell user={user}><Routes><Route path="/super-admin/dashboard" element={<PlatformDashboardPage/>}/><Route path="/super-admin/organizations" element={<PlatformOrganizationsPage/>}/><Route path="/super-admin/reports" element={<PlatformReportsPage/>}/><Route path="/super-admin/notifications" element={<PlatformNotificationsPage/>}/><Route path="*" element={<Navigate to="/super-admin/dashboard" replace/>}/></Routes></PlatformShell>
+  return <PlatformShell user={user}><Routes><Route path="/super-admin/dashboard" element={<PlatformDashboardPage/>}/><Route path="/super-admin/organizations" element={<PlatformOrganizationsPage/>}/><Route path="/super-admin/users" element={<PlatformUsersPage/>}/><Route path="/super-admin/reports" element={<PlatformReportsPage/>}/><Route path="/super-admin/notifications" element={<PlatformNotificationsPage/>}/><Route path="*" element={<Navigate to="/super-admin/dashboard" replace/>}/></Routes></PlatformShell>
 }
 
 function NotFoundPage() {

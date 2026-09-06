@@ -257,6 +257,47 @@ def test_configured_super_admin_can_read_platform_aggregates() -> None:
         get_settings.cache_clear()
 
 
+def test_super_admin_can_create_users_and_organization_admins() -> None:
+    previous = os.environ.get("SUPER_ADMIN_EMAILS")
+    os.environ["SUPER_ADMIN_EMAILS"] = "platform@example.com"
+    get_settings.cache_clear()
+    try:
+        client, organization_admin_headers = client_and_token()
+        platform_signup = client.post("/api/v1/subscription/auth/signup", json={"name": "Platform Owner", "email": "platform@example.com", "password": "LivePass123!"})
+        assert platform_signup.status_code == 201 and platform_signup.json()["data"]["user"]["role"] == "super_admin"
+        platform_headers = {"Authorization": f"Bearer {platform_signup.json()['data']['access_token']}"}
+
+        listed = client.get("/api/v1/subscription/platform/users", headers=platform_headers)
+        assert listed.status_code == 200 and listed.json()["meta"]["total"] == 2
+        assert listed.json()["data"][0]["organization_name"] == "Argo Subscription Management"
+        organization_id = listed.json()["data"][0]["organization_id"]
+
+        created_user = client.post("/api/v1/subscription/platform/users", headers=platform_headers, json={"organization_id": organization_id, "name": "Managed Subscriber", "email": "managed-subscriber@example.com", "password": "ManagedPass123!", "role": "user"})
+        assert created_user.status_code == 201
+        created_user_payload = created_user.json()["data"]
+        assert created_user_payload["role"] == "user" and "password" not in created_user_payload and "access_token" not in created_user_payload
+        assert client.post("/api/v1/subscription/auth/login", json={"email": "managed-subscriber@example.com", "password": "ManagedPass123!"}).status_code == 200
+
+        created_admin = client.post("/api/v1/subscription/platform/users", headers=platform_headers, json={"organization_id": organization_id, "name": "Managed Administrator", "email": "managed-admin@example.com", "password": "ManagedPass123!", "role": "org_admin"})
+        assert created_admin.status_code == 201 and created_admin.json()["data"]["role"] == "org_admin"
+
+        duplicate = client.post("/api/v1/subscription/platform/users", headers=platform_headers, json={"organization_id": organization_id, "name": "Duplicate", "email": "managed-admin@example.com", "password": "ManagedPass123!", "role": "user"})
+        assert duplicate.status_code == 409
+        invalid_organization = client.post("/api/v1/subscription/platform/users", headers=platform_headers, json={"organization_id": "00000000-0000-0000-0000-000000000404", "name": "Missing Organization", "email": "missing-org@example.com", "password": "ManagedPass123!", "role": "user"})
+        assert invalid_organization.status_code == 404
+        invalid_role = client.post("/api/v1/subscription/platform/users", headers=platform_headers, json={"organization_id": organization_id, "name": "Invalid Role", "email": "invalid-role@example.com", "password": "ManagedPass123!", "role": "super_admin"})
+        assert invalid_role.status_code == 422
+        protected_super_admin = client.post("/api/v1/subscription/platform/users", headers=platform_headers, json={"organization_id": organization_id, "name": "Platform Owner Copy", "email": "platform@example.com", "password": "ManagedPass123!", "role": "user"})
+        assert protected_super_admin.status_code == 403
+        assert client.get("/api/v1/subscription/platform/users", headers=organization_admin_headers).status_code == 403
+    finally:
+        if previous is None:
+            os.environ.pop("SUPER_ADMIN_EMAILS", None)
+        else:
+            os.environ["SUPER_ADMIN_EMAILS"] = previous
+        get_settings.cache_clear()
+
+
 def test_organization_admin_can_assign_roles_without_removing_last_admin() -> None:
     client, admin_headers = client_and_token()
     signup = client.post("/api/v1/subscription/auth/signup", json={"name": "Managed User", "email": "managed@example.com", "password": "LivePass123!"})

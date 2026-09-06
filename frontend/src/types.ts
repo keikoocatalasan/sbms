@@ -24,6 +24,15 @@ export type PlatformOrganization = BaseRecord & {
   users: number
 }
 
+export type PlatformUser = BaseRecord & {
+  organization_id: string
+  organization_name: string
+  name: string
+  email: string
+  status: 'active' | 'suspended' | 'inactive'
+  role: 'org_admin' | 'user' | 'super_admin'
+}
+
 export type BaseRecord = {
   id: string
   created_at: string
